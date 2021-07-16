@@ -114,7 +114,7 @@ func TestStartSpanFromThriftContext(t *testing.T) {
 	ctx = thrift.SetHeader(ctx, thriftbp.HeaderTracingTrace, trace)
 	ctx = thrift.SetHeader(ctx, thriftbp.HeaderTracingSpan, spanID)
 
-	ctx, span := thriftbp.StartSpanFromThriftContext(ctx, name)
+	_, span := thriftbp.StartSpanFromThriftContext(ctx, name)
 
 	if span.TraceID() != trace {
 		t.Errorf(
@@ -218,7 +218,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 				processor(func(ctx context.Context) {
 					deadline, ok := ctx.Deadline()
 					if ok {
-						t.Errorf("Expected no deadline set, got %v", deadline.Sub(time.Now()))
+						t.Errorf("Expected no deadline set, got %v", time.Until(deadline))
 					}
 				}),
 				thriftbp.ExtractDeadlineBudget,
@@ -240,7 +240,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 				processor(func(ctx context.Context) {
 					deadline, ok := ctx.Deadline()
 					if ok {
-						t.Errorf("Expected no deadline set, got %v", deadline.Sub(time.Now()))
+						t.Errorf("Expected no deadline set, got %v", time.Until(deadline))
 					}
 				}),
 				thriftbp.ExtractDeadlineBudget,
@@ -265,7 +265,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 						t.Fatal("Deadline not set")
 					}
 
-					duration := deadline.Sub(time.Now())
+					duration := time.Until(deadline)
 					if duration.Round(time.Millisecond).Milliseconds() != 50 {
 						t.Errorf("Expected deadline to be 50ms, got %v", duration)
 					}
@@ -275,4 +275,39 @@ func TestExtractDeadlineBudget(t *testing.T) {
 			wrapped.Process(ctx, nil, nil)
 		},
 	)
+}
+
+func TestPanicMiddleware(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		panicErr := errors.New("oops")
+		next := thrift.WrappedTProcessorFunction{
+			Wrapped: func(ctx context.Context, seqId int32, in, out thrift.TProtocol) (bool, thrift.TException) {
+				panic(panicErr)
+			},
+		}
+		wrapped := thriftbp.RecoverPanic("test", next)
+		ok, err := wrapped.Process(context.Background(), 1, nil, nil)
+		if ok {
+			t.Errorf("expected ok to be false, got true")
+		}
+		if !errors.Is(err, panicErr) {
+			t.Errorf("error mismatch, expectd %v, got %v", panicErr, err)
+		}
+	})
+
+	t.Run("non-error", func(t *testing.T) {
+		next := thrift.WrappedTProcessorFunction{
+			Wrapped: func(ctx context.Context, seqId int32, in, out thrift.TProtocol) (bool, thrift.TException) {
+				panic("oops")
+			},
+		}
+		wrapped := thriftbp.RecoverPanic("test", next)
+		ok, err := wrapped.Process(context.Background(), 1, nil, nil)
+		if ok {
+			t.Errorf("expected ok to be false, got true")
+		}
+		if err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
 }

@@ -92,8 +92,8 @@ func NewServer(cfg ServerConfig) (*thrift.TSimpleServer, error) {
 	server := thrift.NewTSimpleServer4(
 		thrift.WrapProcessor(cfg.Processor, cfg.Middlewares...),
 		transport,
-		thrift.NewTHeaderTransportFactory(nil),
-		thrift.NewTHeaderProtocolFactory(),
+		thrift.NewTHeaderTransportFactoryConf(nil, nil),
+		thrift.NewTHeaderProtocolFactoryConf(nil),
 	)
 	server.SetForwardHeaders(HeadersToForward)
 	server.SetLogger(cfg.Logger)
@@ -115,9 +115,9 @@ func NewBaseplateServer(
 	)
 	middlewares = append(middlewares, cfg.Middlewares...)
 	cfg.Middlewares = middlewares
-	cfg.Logger = log.ZapWrapper(bp.Config().Log.Level).ToThriftLogger()
-	cfg.Addr = bp.Config().Addr
-	cfg.Timeout = bp.Config().Timeout
+	cfg.Logger = log.ZapWrapper(bp.GetConfig().Log.Level).ToThriftLogger()
+	cfg.Addr = bp.GetConfig().Addr
+	cfg.Timeout = bp.GetConfig().Timeout
 	cfg.Socket = nil
 	srv, err := NewServer(cfg)
 	if err != nil {

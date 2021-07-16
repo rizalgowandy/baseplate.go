@@ -46,9 +46,9 @@ var (
 
 // ClientPoolConfig errors are returned if the configuration validation fails.
 var (
-	ErrConfigMissingServiceSlug = errors.New("ServiceSlug cannot be empty")
-	ErrConfigMissingAddr        = errors.New("Addr cannot be empty")
-	ErrConfigInvalidConnections = errors.New("InitialConnections cannot be bigger than MaxConnections")
+	ErrConfigMissingServiceSlug = errors.New("`ServiceSlug` cannot be empty")
+	ErrConfigMissingAddr        = errors.New("`Addr` cannot be empty")
+	ErrConfigInvalidConnections = errors.New("`InitialConnections` cannot be bigger than `MaxConnections`")
 )
 
 // WithDefaultRetryableCodes returns a list including the given error codes and
@@ -58,24 +58,12 @@ var (
 //
 // 2. TOO_MANY_REQUESTS
 //
-// 3. INTERNAL_SERVER_ERROR
-//
-// 4. BAD_GATEWAY
-//
-// 5. SERVICE_UNAVAILABLE
-//
-// 6. TIMEOUT
-//
-// 7. INSUFFICIENT_STORAGE
+// 3. SERVICE_UNAVAILABLE
 func WithDefaultRetryableCodes(codes ...int32) []int32 {
 	return append([]int32{
 		int32(baseplatethrift.ErrorCode_TOO_EARLY),
 		int32(baseplatethrift.ErrorCode_TOO_MANY_REQUESTS),
-		int32(baseplatethrift.ErrorCode_INTERNAL_SERVER_ERROR),
-		int32(baseplatethrift.ErrorCode_BAD_GATEWAY),
 		int32(baseplatethrift.ErrorCode_SERVICE_UNAVAILABLE),
-		int32(baseplatethrift.ErrorCode_TIMEOUT),
-		int32(baseplatethrift.ErrorCode_INSUFFICIENT_STORAGE),
 	}, codes...)
 }
 
@@ -110,12 +98,13 @@ func IDLExceptionSuppressor(err error) bool {
 var _ errorsbp.Suppressor = IDLExceptionSuppressor
 
 type wrappedBaseplateError struct {
-	cause baseplateError
+	cause error
+	bpErr baseplateError
 }
 
 func (e wrappedBaseplateError) Error() string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("baseplate.Error: %q", e.cause.GetMessage()))
+	sb.WriteString(fmt.Sprintf("baseplate.Error: %q", e.bpErr.GetMessage()))
 	first := true
 	writeSeparator := func() {
 		if first {
@@ -125,17 +114,17 @@ func (e wrappedBaseplateError) Error() string {
 			sb.WriteString(", ")
 		}
 	}
-	if e.cause.IsSetCode() {
+	if e.bpErr.IsSetCode() {
 		writeSeparator()
-		sb.WriteString(fmt.Sprintf("code=%d", e.cause.GetCode()))
+		sb.WriteString(fmt.Sprintf("code=%d", e.bpErr.GetCode()))
 	}
-	if e.cause.IsSetRetryable() {
+	if e.bpErr.IsSetRetryable() {
 		writeSeparator()
-		sb.WriteString(fmt.Sprintf("retryable=%v", e.cause.GetRetryable()))
+		sb.WriteString(fmt.Sprintf("retryable=%v", e.bpErr.GetRetryable()))
 	}
-	if e.cause.IsSetDetails() {
+	if e.bpErr.IsSetDetails() {
 		writeSeparator()
-		sb.WriteString(fmt.Sprintf("details=%#v", e.cause.GetDetails()))
+		sb.WriteString(fmt.Sprintf("details=%#v", e.bpErr.GetDetails()))
 	}
 	if !first {
 		sb.WriteString(")")
@@ -159,7 +148,8 @@ func WrapBaseplateError(e error) error {
 	var bpErr baseplateError
 	if errors.As(e, &bpErr) {
 		return wrappedBaseplateError{
-			cause: bpErr,
+			cause: e,
+			bpErr: bpErr,
 		}
 	}
 	return e

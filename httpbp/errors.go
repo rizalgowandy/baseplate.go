@@ -1,6 +1,7 @@
 package httpbp
 
 import (
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -62,6 +63,20 @@ const (
 	// DefaultErrorTemplateName is the name for the shared, default HTML template
 	// for error responses.
 	DefaultErrorTemplateName = "httpbp/error"
+)
+
+// Well-known errors for middleware layer.
+var (
+	// ErrConcurrencyLimit is returned by the max concurrency middleware if
+	// there are too many requests in-flight.
+	ErrConcurrencyLimit = errors.New("hit concurrency limit")
+)
+
+// ClientConfig errors are returned if the configuration validation fails.
+var (
+	ErrConfigMissingSlug              = errors.New("slug cannot be empty")
+	ErrConfigInvalidMaxErrorReadAhead = errors.New("maxErrorReadAhead value needs to be positive")
+	ErrConfigInvalidMaxConnections    = errors.New("maxConnections value needs to be positive")
 )
 
 // HTTPError is an error that and can be returned by an  HTTPHandler to return a
@@ -672,8 +687,8 @@ func (ce ClientError) RetryAfterDuration() time.Duration {
 
 // Retryable implements retrybp.RetryableError.
 //
-// It returns no decision (0) if the status code is unknown (0),
-// true (1) on any of the following conditions and false (-1) otherwise:
+// It returns true (1) on any of the following conditions and no decision (0)
+// otherwise:
 //
 // - There was a valid Retry-After header in the response
 //
@@ -681,11 +696,7 @@ func (ce ClientError) RetryAfterDuration() time.Duration {
 //
 //   * 425 (too early)
 //   * 429 (too many requests)
-//   * 500 (internal server error)
-//   * 502 (bad gateway)
 //   * 503 (service unavailable)
-//   * 504 (gateway timeout)
-//   * 507 (insufficient storage)
 func (ce ClientError) Retryable() int {
 	if ce.StatusCode == 0 {
 		// We didn't even get a response, not enough information to make a decision.
@@ -700,16 +711,12 @@ func (ce ClientError) Retryable() int {
 
 	switch ce.StatusCode {
 	default:
-		return -1
+		return 0
 
 	case
 		http.StatusTooEarly,
 		http.StatusTooManyRequests,
-		http.StatusInternalServerError,
-		http.StatusBadGateway,
-		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout,
-		http.StatusInsufficientStorage:
+		http.StatusServiceUnavailable:
 
 		return 1
 	}
@@ -745,7 +752,7 @@ func ClientErrorFromResponse(resp *http.Response) error {
 		// Retry-After header could be either an absolute time or a relative time.
 		t, err := http.ParseTime(retryAfter)
 		if err == nil {
-			ce.RetryAfter = t.Sub(time.Now())
+			ce.RetryAfter = time.Until(t)
 		} else {
 			// RFC says the relative time format of RetryAfter should be an integer,
 			// but in reality floats could be used for better precision.
