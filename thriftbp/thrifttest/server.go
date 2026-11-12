@@ -6,7 +6,7 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	baseplate "github.com/reddit/baseplate.go"
+	"github.com/reddit/baseplate.go"
 	"github.com/reddit/baseplate.go/batchcloser"
 	"github.com/reddit/baseplate.go/ecinterface"
 	"github.com/reddit/baseplate.go/errorsbp"
@@ -46,6 +46,8 @@ const (
 
 	// ReportClientPoolStats is the value that is always used for
 	// ServerConfig.ClientConfig.ReportPoolStats.
+	//
+	// Deprecated: deprecated with the server config field.
 	ReportClientPoolStats = false
 
 	loopbackAddr = "127.0.0.1:0"
@@ -82,6 +84,11 @@ type ServerConfig struct {
 	// Optional, the ErrorSpanSuppressor used to create InjectServerSpan
 	// middleware.
 	ErrorSpanSuppressor errorsbp.Suppressor
+
+	// Optional, the edge context implementation.
+	//
+	// If it's not set, ecinterface.Mock() will be used instead.
+	EdgeContextImpl ecinterface.Interface
 }
 
 // Server is a test server returned by NewBaseplateServer.  It contains both
@@ -108,10 +115,13 @@ func (s *Server) Start(ctx context.Context) {
 
 // Close the underying Server and Baseplate as well as the thriftbp.ClientPool.
 func (s *Server) Close() error {
-	closers := batchcloser.New(s.Server, s.Baseplate())
+	closers := batchcloser.New()
+	// close the ClientPool first so the server doesn't hang waiting for it to
+	// close while trying to close itself.
 	if s.ClientPool != nil {
 		closers.Add(s.ClientPool)
 	}
+	closers.Add(s.Server, s.Baseplate())
 	return closers.Close()
 }
 
@@ -120,57 +130,6 @@ func (s *Server) Close() error {
 //
 // This is inspired by httptest.NewServer from the go standard library and can
 // be used to test a thrift service.
-//
-// "cfg" may be empty, if it is, sane defaults will be chosen.
-// The server and pool that are returned should be closed when done, but the
-// Baseplate used by the server does not need to be.
-//
-// Here is an example usage of NewBaseplateServer:
-//
-//	import (
-//		"context"
-//		"testing"
-//
-//		baseplatethrift "github.com/reddit/baseplate.go/internal/gen-go/reddit/baseplate"
-//		"github.com/reddit/baseplate.go/secrets"
-//		"github.com/reddit/baseplate.go/thriftbp/thrifttest"
-//	)
-//
-//	type BaseplateService struct {
-//		Fail bool
-//		Err  error
-//	}
-//
-//	func (srv BaseplateService) IsHealthy(ctx context.Context, req *baseplatethrift.IsHealthyRequest) (r bool, err error) {
-//		return !srv.Fail, srv.Err
-//	}
-//
-//	func TestService(t *testing.T){
-//		// Initialize this properly in a real test
-//		var secrets *secrets.Store
-//
-//		ctx, cancel := context.WithCancel(context.Background())
-//		defer cancel()
-//
-//		processor := baseplatethrift.NewBaseplateServiceV2Processor(BaseplateService{})
-//		server, err := thrifttest.NewBaseplateServer(store, processor, nil, thrifttest.ServerConfig{})
-//		if err != nil {
-//			t.Fatal(err)
-//		}
-//		// cancelling the context will close the server.
-//		server.Start(ctx)
-//
-//		client := baseplatethrift.NewBaseplateServiceV2Client(server.ClientPool)
-//		success, err := client.IsHealthy(ctx)
-//
-//		if err != nil {
-//			t.Errorf("expected no error, got %v", err)
-//		}
-//
-//		if !success {
-// 			t.Errorf("result mismatch, expected %v, got %v", c.expected.result, result)
-//		}
-//	}
 func NewBaseplateServer(cfg ServerConfig) (*Server, error) {
 	socket, err := thrift.NewTServerSocket(loopbackAddr)
 	if err != nil {
@@ -181,11 +140,15 @@ func NewBaseplateServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 
+	if cfg.EdgeContextImpl == nil {
+		cfg.EdgeContextImpl = ecinterface.Mock()
+	}
+
 	cfg.ServerConfig.Addr = socket.Addr().String()
 	bp := baseplate.NewTestBaseplate(baseplate.NewTestBaseplateArgs{
 		Config:          cfg.ServerConfig,
 		Store:           cfg.SecretStore,
-		EdgeContextImpl: ecinterface.Mock(),
+		EdgeContextImpl: cfg.EdgeContextImpl,
 	})
 	middlewares := thriftbp.BaseplateDefaultProcessorMiddlewares(
 		thriftbp.DefaultProcessorMiddlewaresArgs{
@@ -196,7 +159,6 @@ func NewBaseplateServer(cfg ServerConfig) (*Server, error) {
 	middlewares = append(middlewares, cfg.ProcessorMiddlewares...)
 	serverCfg := thriftbp.ServerConfig{
 		Socket:      socket,
-		Logger:      thrift.NopLogger,
 		Processor:   cfg.Processor,
 		Middlewares: middlewares,
 	}
@@ -207,8 +169,7 @@ func NewBaseplateServer(cfg ServerConfig) (*Server, error) {
 	}
 	server := &Server{Server: thriftbp.ApplyBaseplate(bp, srv)}
 
-	cfg.ClientConfig.Addr = server.Baseplate().Config().Addr
-	cfg.ClientConfig.ReportPoolStats = ReportClientPoolStats
+	cfg.ClientConfig.Addr = server.Baseplate().GetConfig().Addr
 	cfg.ClientConfig.InitialConnections = InitialClientConnections
 
 	if cfg.ClientConfig.ConnectTimeout == 0 {
@@ -221,7 +182,7 @@ func NewBaseplateServer(cfg ServerConfig) (*Server, error) {
 		cfg.ClientConfig.ServiceSlug = DefaultServiceSlug
 	}
 	if cfg.ClientConfig.EdgeContextImpl == nil {
-		cfg.ClientConfig.EdgeContextImpl = ecinterface.Mock()
+		cfg.ClientConfig.EdgeContextImpl = cfg.EdgeContextImpl
 	}
 	if cfg.ClientConfig.MaxConnections == 0 {
 		cfg.ClientConfig.MaxConnections = DefaultClientMaxConnections

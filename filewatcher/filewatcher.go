@@ -2,23 +2,28 @@ package filewatcher
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"sync/atomic"
+	"io/fs"
 	"time"
 
-	"gopkg.in/fsnotify.v1"
-
+	v2 "github.com/reddit/baseplate.go/filewatcher/v2"
+	"github.com/reddit/baseplate.go/filewatcher/v2/fwtest"
 	"github.com/reddit/baseplate.go/log"
 )
 
-// FileWatcher loads and parses data from a file and watches for changes to that
-// file in order to refresh it's stored data.
+// DefaultFSEventsDelay is the default FSEventsDelay used when creating a new
+// FileWatcher.
+const DefaultFSEventsDelay = v2.DefaultFSEventsDelay
+
+// DefaultPollingInterval is the default PollingInterval used when creating a
+// new FileWatcher.
+const DefaultPollingInterval = v2.DefaultPollingInterval
+
+// FileWatcher loads and parses data from a file or directory, and watches for
+// changes in order to refresh its stored data.
 type FileWatcher interface {
 	// Get returns the latest, parsed data from the FileWatcher.
-	Get() interface{}
+	Get() any
 
 	// Stop stops the FileWatcher.
 	//
@@ -31,41 +36,59 @@ type FileWatcher interface {
 }
 
 // InitialReadInterval is the interval to keep retrying to open the file when
-// creating a new file watcher, when the file was not initially available.
+// creating a new FileWatcher, when the file was not initially available.
 //
 // It's intentionally defined as a variable instead of constant, so that the
 // caller can tweak its value when needed.
-var InitialReadInterval = time.Second / 2
+var InitialReadInterval = v2.DefaultInitialReadInterval
 
 // DefaultMaxFileSize is the default MaxFileSize used when it's <= 0.
 //
-// It's 1MiB, which is following the size limit of Apache ZooKeeper nodes.
-const DefaultMaxFileSize = 1024 * 1024
+// It's 10 MiB, with hard limit multiplier of 10.
+const (
+	DefaultMaxFileSize  = v2.DefaultMaxFileSize
+	HardLimitMultiplier = v2.HardLimitMultiplier
+)
 
 // A Parser is a callback function to be called when a watched file has its
 // content changed, or is read for the first time.
 //
 // Please note that Parser should always return the consistent type.
 // Inconsistent type will cause panic, as does returning nil data and nil error.
-type Parser func(f io.Reader) (data interface{}, err error)
+type Parser = v2.Parser[any]
+
+// A DirParser is a callback function that will be called when the watched
+// directory has its content changed or is read for the first time.
+//
+// Please note that a DirParser must return a consistent type.
+// Inconsistent types will cause a panic,
+// as does returning nil data and nil error.
+//
+// Use WrapDirParser to wrap it into a Parser to be used with FileWatcher.
+type DirParser = v2.DirParser[any]
+
+// WrapDirParser wraps a DirParser for a directory to a Parser.
+//
+// When using FileWatcher to watch a directory instead of a single file,
+// you MUST use WrapDirParser instead of any other Parser implementations.
+func WrapDirParser(dp DirParser) Parser {
+	return v2.WrapDirParser(dp)
+}
 
 // Result is the return type of New. Use Get function to get the actual data.
 type Result struct {
-	data atomic.Value
-
-	ctx    context.Context
-	cancel context.CancelFunc
+	result *v2.Result[any]
 }
 
-// Get returns the latest parsed data from the file watcher.
+// Get returns the latest parsed data from the FileWatcher.
 //
-// Although the type is interface{},
+// Although the type is any,
 // it's guaranteed to be whatever actual type is implemented inside Parser.
-func (r *Result) Get() interface{} {
-	return r.data.Load()
+func (r *Result) Get() any {
+	return r.result.Get()
 }
 
-// Stop stops the file watcher.
+// Stop stops the FileWatcher.
 //
 // After Stop is called you won't get any updates on the file content,
 // but you can still call Get to get the last content before stopping.
@@ -73,52 +96,7 @@ func (r *Result) Get() interface{} {
 // It's OK to call Stop multiple times.
 // Calls after the first one are essentially no-op.
 func (r *Result) Stop() {
-	r.cancel()
-}
-
-func (r *Result) watcherLoop(
-	watcher *fsnotify.Watcher,
-	path string,
-	parser Parser,
-	logger log.Wrapper,
-) {
-	file := filepath.Base(path)
-	for {
-		select {
-		case <-r.ctx.Done():
-			watcher.Close()
-			return
-
-		case err := <-watcher.Errors:
-			logger.Log(context.Background(), "filewatcher: watcher error: "+err.Error())
-
-		case ev := <-watcher.Events:
-			if filepath.Base(ev.Name) != file {
-				continue
-			}
-
-			switch ev.Op {
-			default:
-				// Ignore uninterested events.
-			case fsnotify.Create, fsnotify.Write:
-				// Wrap with an anonymous function to make sure that defer works.
-				func() {
-					f, err := os.Open(path)
-					if err != nil {
-						logger.Log(context.Background(), "filewatcher: I/O error: "+err.Error())
-						return
-					}
-					defer f.Close()
-					d, err := parser(f)
-					if err != nil {
-						logger.Log(context.Background(), "filewatcher: parser error: "+err.Error())
-					} else {
-						r.data.Store(d)
-					}
-				}()
-			}
-		}
-	}
+	r.result.Close()
 }
 
 var (
@@ -126,9 +104,11 @@ var (
 )
 
 // Config defines the config to be used in New function.
+//
+// Can be deserialized from YAML.
 type Config struct {
 	// The path to the file to be watched, required.
-	Path string
+	Path string `yaml:"path"`
 
 	// The parser to parse the data load, required.
 	Parser Parser
@@ -137,34 +117,49 @@ type Config struct {
 	// either returned by parser or by the underlying file system watcher.
 	// Please note that this does not include errors returned by the first parser
 	// call, which will be returned directly.
-	Logger log.Wrapper
+	//
+	// Deprecated: Errors will be logged via slog at error level instead.
+	Logger log.Wrapper `yaml:"logger,omitempty"`
 
 	// Optional. When <=0 DefaultMaxFileSize will be used instead.
-	// This limits the size of the file that will be read into memory and sent to
-	// the parser, to limit memory usage.
-	// If the file content is larger than MaxFileSize,
-	// we don't treat that as an error,
-	// but the parser will only receive the first MaxFileSize bytes of content.
 	//
-	// The reasons behind the decision of not treating them as an error are:
-	// 1. Some parsers only read up to what they need (example: json),
-	//    so extra garbage after that won't cause any problems.
-	// 2. For parsers that won't work when they only receive partial data,
-	//    this will cause them to return an error,
-	//    which will be logged and we won't update the parsed data,
-	//    so it's essentially the same as treating those as errors.
-	// 3. Getting the real size of the content without actually reading them could
-	//    be tricky. Only send partial data to parsers is a more robust solution.
-	MaxFileSize int64
+	// This is completely ignored when DirParser is used.
+	//
+	// This is the soft limit,
+	// we will also auto add a hard limit which is 10x (see HardLimitMultiplier)
+	// of soft limit.
+	//
+	// If the soft limit is violated,
+	// the violation will be reported via log.DefaultWrapper and prometheus
+	// counter of limitopen_softlimit_violation_total,
+	// but it does not stop the normal parsing process.
+	//
+	// If the hard limit is violated,
+	// The loading of the file will fail immediately.
+	MaxFileSize int64 `yaml:"maxFileSize"`
+
+	// Optional, the interval to check file changes proactively.
+	//
+	// Default to DefaultPollingInterval.
+	// To disable polling completely, set it to a negative value.
+	//
+	// Without polling filewatcher relies solely on fs events from the parent
+	// directory. This works for most cases but will not work in the cases that
+	// the parent directory will be remount upon change
+	// (for example, k8s ConfigMap).
+	PollingInterval time.Duration `yaml:"pollingInterval"`
+
+	// Optional, the delay between receiving the fs events and actually reading
+	// and parsing the changes.
+	//
+	// It's used to avoid short bursts of fs events (for example, when watching a
+	// directory) causing reading and parsing repetively.
+	//
+	// Defaut to DefaultFSEventsDelay.
+	FSEventsDelay time.Duration `yaml:"fsEventsDelay"`
 }
 
-func limitParser(parser Parser, limit int64) Parser {
-	return func(f io.Reader) (interface{}, error) {
-		return parser(io.LimitReader(f, limit))
-	}
-}
-
-// New creates a new file watcher.
+// New creates a new FileWatcher.
 //
 // If the path is not available at the time of calling,
 // it blocks until the file becomes available, or context is cancelled,
@@ -175,71 +170,23 @@ func limitParser(parser Parser, limit int64) Parser {
 // Please note that this does not include errors returned by the first parser
 // call, which will be returned directly.
 func New(ctx context.Context, cfg Config) (*Result, error) {
-	limit := cfg.MaxFileSize
-	if limit <= 0 {
-		limit = DefaultMaxFileSize
+	opts := []v2.Option{
+		v2.WithInitialReadInterval(InitialReadInterval),
 	}
-	parser := limitParser(cfg.Parser, limit)
-
-	var f *os.File
-
-	for {
-		select {
-		default:
-		case <-ctx.Done():
-			return nil, fmt.Errorf("filewatcher: context cancelled while waiting for file under %q to load. %w", cfg.Path, ctx.Err())
-		}
-
-		var err error
-		f, err = os.Open(cfg.Path)
-		if os.IsNotExist(err) {
-			time.Sleep(InitialReadInterval)
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		break
+	if cfg.MaxFileSize > 0 {
+		opts = append(opts, v2.WithFileSizeLimit(cfg.MaxFileSize))
 	}
-
-	defer f.Close()
-
-	var watcher *fsnotify.Watcher
-	watcher, err := fsnotify.NewWatcher()
+	if cfg.PollingInterval != 0 {
+		opts = append(opts, v2.WithPollingInterval(cfg.PollingInterval))
+	}
+	if cfg.FSEventsDelay > 0 {
+		opts = append(opts, v2.WithFSEventsDelay(cfg.FSEventsDelay))
+	}
+	result, err := v2.New(ctx, cfg.Path, cfg.Parser, opts...)
 	if err != nil {
 		return nil, err
 	}
-	// Note: We need to watch the parent directory instead of the file itself,
-	// because only watching the file won't give us CREATE events,
-	// which will happen with atomic renames.
-	err = watcher.Add(filepath.Dir(cfg.Path))
-	if err != nil {
-		return nil, err
-	}
-
-	var d interface{}
-	d, err = parser(f)
-	if err != nil {
-		watcher.Close()
-		return nil, err
-	}
-	res := &Result{}
-	res.data.Store(d)
-	res.ctx, res.cancel = context.WithCancel(context.Background())
-
-	go res.watcherLoop(watcher, cfg.Path, parser, cfg.Logger)
-
-	return res, nil
-}
-
-// NewMockFilewatcher returns a pointer to a new MockFileWatcher object
-// initialized with the given io.Reader and Parser.
-func NewMockFilewatcher(r io.Reader, parser Parser) (*MockFileWatcher, error) {
-	fw := &MockFileWatcher{parser: parser}
-	if err := fw.Update(r); err != nil {
-		return nil, err
-	}
-	return fw, nil
+	return &Result{result: result}, nil
 }
 
 // MockFileWatcher is an implementation of FileWatcher that does not actually read
@@ -247,29 +194,67 @@ func NewMockFilewatcher(r io.Reader, parser Parser) (*MockFileWatcher, error) {
 // with NewMockFilewatcher. It provides an additional Update method that allows
 // you to update this data after it has been created.
 type MockFileWatcher struct {
-	data   atomic.Value
-	parser Parser
+	fake *fwtest.FakeFileWatcher[any]
+}
+
+// NewMockFilewatcher returns a pointer to a new MockFileWatcher object
+// initialized with the given io.Reader and Parser.
+func NewMockFilewatcher(r io.Reader, parser Parser) (*MockFileWatcher, error) {
+	fake, err := fwtest.NewFakeFilewatcher(r, parser)
+	if err != nil {
+		return nil, err
+	}
+	return &MockFileWatcher{fake: fake}, nil
 }
 
 // Update updates the data of the MockFileWatcher using the given io.Reader and
-// the Parser used to initialize the file watcher.
+// the Parser used to initialize the FileWatcher.
 //
 // This method is not threadsafe.
 func (fw *MockFileWatcher) Update(r io.Reader) error {
-	data, err := fw.parser(r)
-	if err != nil {
-		return err
-	}
-	fw.data.Store(data)
-	return nil
+	return fw.fake.Update(r)
 }
 
 // Get returns the parsed data.
-func (fw *MockFileWatcher) Get() interface{} {
-	return fw.data.Load()
+func (fw *MockFileWatcher) Get() any {
+	return fw.fake.Get()
 }
 
 // Stop is a no-op.
 func (fw *MockFileWatcher) Stop() {}
 
-var _ FileWatcher = (*MockFileWatcher)(nil)
+// MockDirWatcher is an implementation of FileWatcher for testing with watching
+// directories.
+type MockDirWatcher struct {
+	fake *fwtest.FakeDirWatcher[any]
+}
+
+// NewMockDirWatcher creates a MockDirWatcher with the initial data and the
+// given DirParser.
+//
+// It provides Update function to update the data after it's been created.
+func NewMockDirWatcher(dir fs.FS, parser DirParser) (*MockDirWatcher, error) {
+	fake, err := fwtest.NewFakeDirWatcher(dir, parser)
+	if err != nil {
+		return nil, err
+	}
+	return &MockDirWatcher{fake: fake}, nil
+}
+
+// Update updates the data stored in this MockDirWatcher.
+func (dw *MockDirWatcher) Update(dir fs.FS) error {
+	return dw.fake.Update(dir)
+}
+
+// Get implements FileWatcher by returning the last updated data.
+func (dw *MockDirWatcher) Get() any {
+	return dw.fake.Get()
+}
+
+// Stop is a no-op.
+func (dw *MockDirWatcher) Stop() {}
+
+var (
+	_ FileWatcher = (*MockFileWatcher)(nil)
+	_ FileWatcher = (*MockDirWatcher)(nil)
+)

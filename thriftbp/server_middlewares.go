@@ -4,17 +4,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
-
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/reddit/baseplate.go/ecinterface"
 	"github.com/reddit/baseplate.go/errorsbp"
+	"github.com/reddit/baseplate.go/headerbp"
+	"github.com/reddit/baseplate.go/internal/gen-go/reddit/baseplate"
+	"github.com/reddit/baseplate.go/internal/thriftint"
+	//lint:ignore SA1019 This library is internal only, not actually deprecated
+	"github.com/reddit/baseplate.go/internalv2compat"
+	"github.com/reddit/baseplate.go/iobp"
 	"github.com/reddit/baseplate.go/log"
-	"github.com/reddit/baseplate.go/metricsbp"
-	"github.com/reddit/baseplate.go/randbp"
+	"github.com/reddit/baseplate.go/prometheusbp"
 	"github.com/reddit/baseplate.go/tracing"
+	"github.com/reddit/baseplate.go/transport"
 )
 
 var (
@@ -41,13 +49,20 @@ type DefaultProcessorMiddlewaresArgs struct {
 
 	// Report the payload size metrics with this sample rate.
 	//
-	// This is optional. If it's not set none of the requests will be sampled.
+	// Deprecated: Prometheus payload size metrics are always 100% reported.
 	ReportPayloadSizeMetricsSampleRate float64
 
 	// The edge context implementation. Optional.
 	//
 	// If it's not set, the global one from ecinterface.Get will be used instead.
 	EdgeContextImpl ecinterface.Interface
+
+	// The schema name for the thrift service being served by this server.
+	//
+	// The Thrift compiler does not generate schema metadata that can be read at
+	// runtime. So we rely on sourcing the service name used in the schema by
+	// passing an un-instrumented TProcessor to GetThriftServiceName.
+	ServiceName string
 }
 
 // BaseplateDefaultProcessorMiddlewares returns the default processor
@@ -61,16 +76,19 @@ type DefaultProcessorMiddlewaresArgs struct {
 //
 // 3. InjectEdgeContext
 //
-// 4. AbandonCanceledRequests
+// 4. ReportPayloadSizeMetrics
 //
-// 5. ReportPayloadSizeMetrics
+// 5. PrometheusServerMiddleware
 func BaseplateDefaultProcessorMiddlewares(args DefaultProcessorMiddlewaresArgs) []thrift.ProcessorMiddleware {
 	return []thrift.ProcessorMiddleware{
+		// Method descriptor middleware needs to be first to support proper telemetry
+		ServerMethodDescriptorMiddleware(args.ServiceName),
 		ExtractDeadlineBudget,
-		InjectServerSpan(args.ErrorSpanSuppressor),
+		InjectServerSpanWithArgs(MonitorServerArgs{ServiceSlug: args.ServiceName}),
 		InjectEdgeContext(args.EdgeContextImpl),
-		AbandonCanceledRequests,
-		ReportPayloadSizeMetrics(args.ReportPayloadSizeMetricsSampleRate),
+		ReportPayloadSizeMetrics(0),
+		PrometheusServerMiddleware,
+		ServerBaseplateHeadersMiddleware(),
 	}
 }
 
@@ -96,56 +114,66 @@ func StartSpanFromThriftContext(ctx context.Context, name string) (context.Conte
 	var headers tracing.Headers
 	var sampled bool
 
-	if str, ok := thrift.GetHeader(ctx, HeaderTracingTrace); ok {
+	if str, ok := header(ctx, transport.HeaderTracingTrace); ok {
 		headers.TraceID = str
 	}
-	if str, ok := thrift.GetHeader(ctx, HeaderTracingSpan); ok {
+	if str, ok := header(ctx, transport.HeaderTracingSpan); ok {
 		headers.SpanID = str
 	}
-	if str, ok := thrift.GetHeader(ctx, HeaderTracingFlags); ok {
+	if str, ok := header(ctx, transport.HeaderTracingFlags); ok {
 		headers.Flags = str
 	}
-	if str, ok := thrift.GetHeader(ctx, HeaderTracingSampled); ok {
-		sampled = str == HeaderTracingSampledTrue
+	if str, ok := header(ctx, transport.HeaderTracingSampled); ok {
+		sampled = str == transport.HeaderTracingSampledTrue
 		headers.Sampled = &sampled
 	}
 
 	return tracing.StartSpanFromHeaders(ctx, name, headers)
 }
 
-// InjectServerSpan implements thrift.ProcessorMiddleware and injects a server
-// span into the `next` context.
-//
-// Starts the server span before calling the `next` TProcessorFunction and stops
-// the span after it finishes.
-// If the function returns an error that's not suppressed by the suppressor,
-// that will be passed to span.Stop.
-//
-// Please note that if suppressor passed in is nil,
-// it will be changed to IDLExceptionSuppressor instead.
-// Please use errorsbp.SuppressNone explicitly instead if that's what's wanted.
-//
-// Note, the span will be created according to tracing related headers already
-// being set on the context object.
-// These should be automatically injected by your thrift.TSimpleServer.
-func InjectServerSpan(suppressor errorsbp.Suppressor) thrift.ProcessorMiddleware {
+func wrapErrorForServerSpan(err error, suppressor errorsbp.Suppressor) error {
 	if suppressor == nil {
 		suppressor = IDLExceptionSuppressor
 	}
-	return func(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
-		return thrift.WrappedTProcessorFunction{
-			Wrapped: func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (success bool, err thrift.TException) {
-				ctx, span := StartSpanFromThriftContext(ctx, name)
-				defer func() {
-					span.FinishWithOptions(tracing.FinishOptions{
-						Ctx: ctx,
-						Err: suppressor.Wrap(err),
-					}.Convert())
-				}()
+	return thriftint.WrapBaseplateError(suppressor.Wrap(err))
+}
 
-				return next.Process(ctx, seqID, in, out)
-			},
-		}
+var injectServerSpanLoggingOnce sync.Once
+
+// InjectServerSpan implements thrift.ProcessorMiddleware and injects a server
+// span into the `next` context.
+//
+// This middleware always use the injected v2 tracing thrift server middleware.
+// If there's no v2 tracing thrift server middleware injected, it's no-op.
+func InjectServerSpan(_ errorsbp.Suppressor) thrift.ProcessorMiddleware {
+	if mw := internalv2compat.V2TracingThriftServerMiddleware(); mw != nil {
+		return mw
+	}
+	return func(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+		// no-op but log for once
+		injectServerSpanLoggingOnce.Do(func() {
+			slog.Warn("thriftbp.InjectServerSpan: internalv2compat.V2TracingThriftServerMiddleware() returned nil")
+		})
+		return next
+	}
+}
+
+type MonitorServerArgs struct {
+	ServiceSlug string
+}
+
+func InjectServerSpanWithArgs(args MonitorServerArgs) thrift.ProcessorMiddleware {
+	if mw := internalv2compat.V2TracingThriftServerMiddlewareWithArgs(internalv2compat.ServerTraceMiddlewareArgs{
+		ServiceName: args.ServiceSlug,
+	}); mw != nil {
+		return mw
+	}
+	return func(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+		// no-op but log for once
+		injectServerSpanLoggingOnce.Do(func() {
+			slog.Warn("thriftbp.InjectServerSpan: internalv2compat.V2TracingThriftServerMiddlewareWithArgs() returned nil")
+		})
+		return next
 	}
 }
 
@@ -153,7 +181,7 @@ func InjectServerSpan(suppressor errorsbp.Suppressor) thrift.ProcessorMiddleware
 // headers set on the context onto the context and configures Thrift to forward
 // the edge requent context header on any Thrift calls made by the server.
 func InitializeEdgeContext(ctx context.Context, impl ecinterface.Interface) context.Context {
-	header, ok := thrift.GetHeader(ctx, HeaderEdgeRequest)
+	header, ok := header(ctx, transport.HeaderEdgeRequest)
 	if !ok {
 		return ctx
 	}
@@ -193,12 +221,20 @@ func InjectEdgeContext(impl ecinterface.Interface) thrift.ProcessorMiddleware {
 func ExtractDeadlineBudget(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
 	return thrift.WrappedTProcessorFunction{
 		Wrapped: func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (bool, thrift.TException) {
-			if s, ok := thrift.GetHeader(ctx, HeaderDeadlineBudget); ok {
-				v, err := strconv.ParseInt(s, 10, 64)
-				if err == nil && v >= 1 {
+			if s, ok := header(ctx, transport.HeaderDeadlineBudget); ok {
+				if v, err := strconv.ParseInt(s, 10, 64); err == nil && v >= 1 {
+					timeout := time.Duration(v) * time.Millisecond
+
 					var cancel context.CancelFunc
-					ctx, cancel = context.WithTimeout(ctx, time.Millisecond*time.Duration(v))
+					ctx, cancel = context.WithTimeout(ctx, timeout)
 					defer cancel()
+
+					// The dropped return here is `ok bool`, not an error.
+					client, _ := header(ctx, transport.HeaderUserAgent)
+					deadlineBudgetHisto.With(prometheus.Labels{
+						methodLabel: name,
+						clientLabel: client,
+					}).Observe(timeout.Seconds())
 				}
 			}
 			return next.Process(ctx, seqID, in, out)
@@ -209,10 +245,15 @@ func ExtractDeadlineBudget(name string, next thrift.TProcessorFunction) thrift.T
 // AbandonCanceledRequests transforms context.Canceled errors into
 // thrift.ErrAbandonRequest errors.
 //
-// When using thrift compiler version >4db7a0a, the context object will be
+// When using thrift compiler version >=v0.14.0, the context object will be
 // canceled after the client closes the connection, and returning
 // thrift.ErrAbandonRequest as the error helps the server to not try to write
 // the error back to the client, but close the connection directly.
+//
+// Deprecated: The checking of ErrAbandonRequest happens before all the
+// middlewares so doing this in a middleware will have no effect. Please do the
+// context.Canceled -> thrift.ErrAbandonRequest translation in your service's
+// endpoint handlers instead.
 func AbandonCanceledRequests(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
 	return thrift.WrappedTProcessorFunction{
 		Wrapped: func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (bool, thrift.TException) {
@@ -244,55 +285,47 @@ func AbandonCanceledRequests(name string, next thrift.TProcessorFunction) thrift
 // If the request is not in THeaderProtocol it does nothing no matter what the
 // sample rate is.
 //
-// For endpoint named "myEndpoint", it reports histograms at:
-//
-// - payload.size.myEndpoint.request
-//
-// - payload.size.myEndpoint.response
-func ReportPayloadSizeMetrics(rate float64) thrift.ProcessorMiddleware {
+// The prometheus histograms are:
+//   - thriftbp_server_request_payload_size_bytes
+//   - thriftbp_server_response_payload_size_bytes
+func ReportPayloadSizeMetrics(_ float64) thrift.ProcessorMiddleware {
 	return func(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
 		return thrift.WrappedTProcessorFunction{
 			Wrapped: func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (bool, thrift.TException) {
-				if randbp.ShouldSampleWithRate(rate) {
-					// Only report for THeader requests
-					if ht, ok := in.Transport().(*thrift.THeaderTransport); ok {
-						protoID := ht.Protocol()
-						cfg := &thrift.TConfiguration{
-							THeaderProtocolID: &protoID,
-						}
-						var itrans, otrans countingTransport
-						trans := thrift.NewTHeaderTransportConf(&itrans, cfg)
-						iproto := thrift.NewTHeaderProtocol(trans)
-						in = &thrift.TDebugProtocol{
-							Logger:      thrift.NopLogger,
-							Delegate:    in,
-							DuplicateTo: iproto,
-						}
-						trans = thrift.NewTHeaderTransportConf(&otrans, cfg)
-						oproto := thrift.NewTHeaderProtocol(trans)
-						out = &thrift.TDebugProtocol{
-							Logger:      thrift.NopLogger,
-							Delegate:    out,
-							DuplicateTo: oproto,
-						}
-
-						defer func() {
-							iproto.Flush(ctx)
-							oproto.Flush(ctx)
-
-							proto := "header-" + tHeaderProtocol2String(protoID)
-							metricsbp.M.HistogramWithRate(metricsbp.RateArgs{
-								Name:             "payload.size." + name + ".request",
-								Rate:             1,
-								AlreadySampledAt: metricsbp.Float64Ptr(rate),
-							}).With("proto", proto).Observe(float64(itrans))
-							metricsbp.M.HistogramWithRate(metricsbp.RateArgs{
-								Name:             "payload.size." + name + ".response",
-								Rate:             1,
-								AlreadySampledAt: metricsbp.Float64Ptr(rate),
-							}).With("proto", proto).Observe(float64(otrans))
-						}()
+				// Only report for THeader requests
+				if ht, ok := in.Transport().(*thrift.THeaderTransport); ok {
+					protoID := ht.Protocol()
+					cfg := &thrift.TConfiguration{
+						THeaderProtocolID: &protoID,
 					}
+					var itrans, otrans countingTransport
+					transport := thrift.NewTHeaderTransportConf(&itrans, cfg)
+					iproto := thrift.NewTHeaderProtocolConf(transport, cfg)
+					in = &thrift.TDuplicateToProtocol{
+						Delegate:    in,
+						DuplicateTo: iproto,
+					}
+					transport = thrift.NewTHeaderTransportConf(&otrans, cfg)
+					oproto := thrift.NewTHeaderProtocolConf(transport, cfg)
+					out = &thrift.TDuplicateToProtocol{
+						Delegate:    out,
+						DuplicateTo: oproto,
+					}
+
+					defer func() {
+						iproto.Flush(ctx)
+						oproto.Flush(ctx)
+						isize := float64(itrans.Size())
+						osize := float64(otrans.Size())
+
+						proto := "header-" + tHeaderProtocol2String(protoID)
+						labels := prometheus.Labels{
+							methodLabel: name,
+							protoLabel:  proto,
+						}
+						serverPayloadSizeRequestBytes.With(labels).Observe(isize)
+						serverPayloadSizeResponseBytes.With(labels).Observe(osize)
+					}()
 				}
 
 				return next.Process(ctx, seqID, in, out)
@@ -302,15 +335,11 @@ func ReportPayloadSizeMetrics(rate float64) thrift.ProcessorMiddleware {
 }
 
 // countingTransport implements thrift.TTransport
-type countingTransport int64
+type countingTransport struct {
+	iobp.CountingSink
+}
 
 var _ thrift.TTransport = (*countingTransport)(nil)
-
-func (c *countingTransport) Write(p []byte) (n int, err error) {
-	n = len(p)
-	*c += countingTransport(n)
-	return
-}
 
 func (countingTransport) IsOpen() bool {
 	return true
@@ -335,5 +364,160 @@ func tHeaderProtocol2String(proto thrift.THeaderProtocolID) string {
 		return "compact"
 	case thrift.THeaderProtocolBinary:
 		return "binary"
+	}
+}
+
+// RecoverPanic recovers from panics raised in the TProccessorFunction chain,
+// logs them, and records a metric indicating that the endpoint recovered from a
+// panic.
+//
+// Deprecated: This is always added as the last server middleware (with a
+// different name) to ensure that other server middlewares get the correct error
+// if panic happened.
+func RecoverPanic(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+	return recoverPanik(name, next)
+}
+
+// recoverPanik recovers from panics raised in the TProccessorFunction chain,
+// logs them, and records a metric indicating that the endpoint recovered from a
+// panic.
+func recoverPanik(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+	counter := panicRecoverCounter.With(prometheus.Labels{
+		methodLabel: name,
+	})
+	return thrift.WrappedTProcessorFunction{
+		Wrapped: func(ctx context.Context, seqId int32, in, out thrift.TProtocol) (ok bool, err thrift.TException) {
+			defer func() {
+				if r := recover(); r != nil {
+					var rErr error
+					if asErr, ok := r.(error); ok {
+						rErr = asErr
+					} else {
+						rErr = fmt.Errorf("panic in %q: %+v", name, r)
+					}
+					log.C(ctx).Errorw(
+						"recovered from panic:",
+						"err", rErr,
+						"endpoint", name,
+					)
+					counter.Inc()
+
+					// changed named return values to show that the request failed and
+					// return the panic value error.
+					ok = false
+					err = thrift.WrapTException(rErr)
+				}
+			}()
+
+			return next.Process(ctx, seqId, in, out)
+		},
+	}
+}
+
+// PrometheusServerMiddleware returns middleware to track Prometheus metrics
+// specific to the Thrift service.
+//
+// It emits the following prometheus metrics:
+//
+// * thrift_server_active_requests gauge with labels:
+//
+//   - thrift_method: the method of the endpoint called
+//
+// * thrift_server_latency_seconds histogram with labels above plus:
+//
+//   - thrift_success: "true" if err == nil, "false" otherwise
+//
+// * thrift_server_requests_total counter with all labels above plus:
+//
+//   - thrift_exception_type: the human-readable exception type, e.g.
+//     baseplate.Error, etc
+//   - thrift_baseplate_status: the numeric status code from a baseplate.Error
+//     as a string if present (e.g. 404), or the empty string
+//   - thrift_baseplate_status_code: the human-readable status code, e.g.
+//     NOT_FOUND, or the empty string
+func PrometheusServerMiddleware(method string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+	process := func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (success bool, err thrift.TException) {
+		start := time.Now()
+		activeRequestLabels := prometheus.Labels{
+			methodLabel: method,
+		}
+		serverActiveRequests.With(activeRequestLabels).Inc()
+
+		defer func() {
+			var baseplateStatusCode, baseplateStatus string
+			exceptionTypeLabel := stringifyErrorType(err)
+			success := prometheusbp.BoolString(err == nil)
+			if err != nil {
+				var bpErr baseplateErrorCoder
+				if errors.As(err, &bpErr) {
+					code := bpErr.GetCode()
+					baseplateStatusCode = strconv.FormatInt(int64(code), 10)
+					if status := baseplate.ErrorCode(code).String(); status != "<UNSET>" {
+						baseplateStatus = status
+					}
+				}
+			}
+
+			latencyLabels := prometheus.Labels{
+				methodLabel:  method,
+				successLabel: success,
+			}
+			serverLatencyDistribution.With(latencyLabels).Observe(time.Since(start).Seconds())
+
+			totalRequestLabels := prometheus.Labels{
+				methodLabel:              method,
+				successLabel:             success,
+				exceptionLabel:           exceptionTypeLabel,
+				baseplateStatusLabel:     baseplateStatus,
+				baseplateStatusCodeLabel: baseplateStatusCode,
+			}
+			serverTotalRequests.With(totalRequestLabels).Inc()
+			serverActiveRequests.With(activeRequestLabels).Dec()
+		}()
+
+		return next.Process(ctx, seqID, in, out)
+	}
+	return thrift.WrappedTProcessorFunction{Wrapped: process}
+}
+
+// ServerBaseplateHeadersMiddleware is a middleware that extracts baseplate headers from the incoming request and adds them to the context.
+func ServerBaseplateHeadersMiddleware() thrift.ProcessorMiddleware {
+	return func(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+		return thrift.WrappedTProcessorFunction{
+			Wrapped: func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (bool, thrift.TException) {
+				readHeaderList := thrift.GetReadHeaderList(ctx)
+				if len(readHeaderList) == 0 {
+					return next.Process(ctx, seqID, in, out)
+				}
+
+				headers := headerbp.NewIncomingHeaders(
+					headerbp.WithThriftService("" /* service */, name),
+				)
+				for _, k := range readHeaderList {
+					v, _ := thrift.GetHeader(ctx, k)
+					headers.RecordHeader(k, v)
+				}
+				ctx = headers.SetOnContext(ctx)
+				return next.Process(ctx, seqID, in, out)
+			},
+		}
+	}
+}
+
+var injectServerMethodDescriptorLoggingOnce sync.Once
+
+// ServerMethodDescriptorMiddleware is a middleware that attaches thrift method descriptors to the context of the incoming request.
+//
+// This is used by telemetry middleware to correctly identify the current thrift service and method.
+func ServerMethodDescriptorMiddleware(serverName string) thrift.ProcessorMiddleware {
+	if provider := internalv2compat.GetV2ThriftMethodDescriptorMiddlewares().ServerMiddlewareProvider; provider != nil {
+		return provider(serverName)
+	}
+	return func(name string, next thrift.TProcessorFunction) thrift.TProcessorFunction {
+		// no-op but log for once
+		injectServerMethodDescriptorLoggingOnce.Do(func() {
+			slog.Warn("thriftbp.ServerMethodDescriptorMiddleware: internalv2compat.GetV2ThriftMethodDescriptorMiddlewares().ServerMiddlewareProvider returned nil")
+		})
+		return next
 	}
 }

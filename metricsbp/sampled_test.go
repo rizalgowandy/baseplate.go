@@ -18,29 +18,34 @@ func TestSampledHistogram(t *testing.T) {
 
 	statsd := NewStatsd(
 		context.Background(),
-		StatsdConfig{},
+		Config{
+			BufferInMemoryForTesting: true,
+		},
 	)
 	statsdSampled := NewStatsd(
 		context.Background(),
-		StatsdConfig{
-			HistogramSampleRate: Float64Ptr(rate),
+		Config{
+			HistogramSampleRate:      Float64Ptr(rate),
+			BufferInMemoryForTesting: true,
 		},
 	)
 	statsdWithTags := NewStatsd(
 		context.Background(),
-		StatsdConfig{
+		Config{
 			Tags: map[string]string{
 				"foo": "bar",
 			},
+			BufferInMemoryForTesting: true,
 		},
 	)
 	statsdWithTagsSampled := NewStatsd(
 		context.Background(),
-		StatsdConfig{
+		Config{
 			HistogramSampleRate: Float64Ptr(rate),
 			Tags: map[string]string{
 				"foo": "bar",
 			},
+			BufferInMemoryForTesting: true,
 		},
 	)
 
@@ -203,31 +208,17 @@ func TestSampledCounter(t *testing.T) {
 
 	statsd := NewStatsd(
 		context.Background(),
-		StatsdConfig{
-			CounterSampleRate: Float64Ptr(1.5),
-		},
-	)
-	statsdSampled := NewStatsd(
-		context.Background(),
-		StatsdConfig{
-			CounterSampleRate: Float64Ptr(rate),
+		Config{
+			BufferInMemoryForTesting: true,
 		},
 	)
 	statsdWithTags := NewStatsd(
 		context.Background(),
-		StatsdConfig{
+		Config{
 			Tags: map[string]string{
 				"foo": "bar",
 			},
-		},
-	)
-	statsdWithTagsSampled := NewStatsd(
-		context.Background(),
-		StatsdConfig{
-			CounterSampleRate: Float64Ptr(rate),
-			Tags: map[string]string{
-				"foo": "bar",
-			},
+			BufferInMemoryForTesting: true,
 		},
 	)
 
@@ -274,20 +265,6 @@ func TestSampledCounter(t *testing.T) {
 			newCounter:   counterLabel,
 		},
 		{
-			tag:          "sampled-no-tags",
-			sampled:      true,
-			expectedRate: rate,
-			statsd:       statsdSampled,
-			newCounter:   counterNoLabel,
-		},
-		{
-			tag:          "sampled-no-tags-with",
-			sampled:      true,
-			expectedRate: rate,
-			statsd:       statsdSampled,
-			newCounter:   counterLabel,
-		},
-		{
 			tag:          "not-sampled-tags",
 			sampled:      false,
 			expectedRate: 1,
@@ -299,20 +276,6 @@ func TestSampledCounter(t *testing.T) {
 			sampled:      false,
 			expectedRate: 1,
 			statsd:       statsdWithTags,
-			newCounter:   counterLabel,
-		},
-		{
-			tag:          "sampled-tags",
-			sampled:      true,
-			expectedRate: rate,
-			statsd:       statsdWithTagsSampled,
-			newCounter:   counterNoLabel,
-		},
-		{
-			tag:          "sampled-tags-with",
-			sampled:      true,
-			expectedRate: rate,
-			statsd:       statsdWithTagsSampled,
 			newCounter:   counterLabel,
 		},
 		{

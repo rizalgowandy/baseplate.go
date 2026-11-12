@@ -2,6 +2,7 @@ package errorsbp_test
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -10,18 +11,18 @@ import (
 
 func TestAdd(t *testing.T) {
 	var err errorsbp.Batch
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf("A new BatchError should contain zero errors: %#v", err.GetErrors())
 	}
 
 	err.Add(nil)
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf("Nil errors should be skipped: %#v", err.GetErrors())
 	}
 
 	err0 := errors.New("foo")
 	err.Add(err0)
-	if len(err.GetErrors()) != 1 {
+	if err.Len() != 1 {
 		t.Errorf("Non-nil errors should be added to the batch: %#v", err.GetErrors())
 	}
 	actual := err.GetErrors()[0]
@@ -31,7 +32,7 @@ func TestAdd(t *testing.T) {
 
 	var another errorsbp.Batch
 	err.Add(another)
-	if len(err.GetErrors()) != 1 {
+	if err.Len() != 1 {
 		t.Errorf("Empty batch should be skipped: %#v", err.GetErrors())
 	}
 	err1 := errors.New("bar")
@@ -39,7 +40,7 @@ func TestAdd(t *testing.T) {
 	err2 := errors.New("foobar")
 	another.Add(err2)
 	err.Add(another)
-	if len(err.GetErrors()) != 3 {
+	if err.Len() != 3 {
 		t.Errorf(
 			"The underlying errors should be added instead of the batch: %#v",
 			err.GetErrors(),
@@ -58,7 +59,7 @@ func TestAdd(t *testing.T) {
 	}
 
 	err.Clear()
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf(
 			"A cleared BatchError should contain zero errors: %#v",
 			err.GetErrors(),
@@ -67,7 +68,7 @@ func TestAdd(t *testing.T) {
 
 	pointer := new(errorsbp.Batch)
 	err.Add(pointer)
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf("Empty batch should be skipped: %#v", err.GetErrors())
 	}
 	err1 = errors.New("bar")
@@ -75,7 +76,7 @@ func TestAdd(t *testing.T) {
 	err2 = errors.New("foobar")
 	pointer.Add(err2)
 	err.Add(pointer)
-	if len(err.GetErrors()) != 2 {
+	if err.Len() != 2 {
 		t.Errorf(
 			"The underlying errors should be added instead of the batch: %#v",
 			err.GetErrors(),
@@ -85,24 +86,24 @@ func TestAdd(t *testing.T) {
 
 func TestAddMultiple(t *testing.T) {
 	var err errorsbp.Batch
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf("A new BatchError should contain zero errors: %#v", err.GetErrors())
 	}
 
 	err.Add()
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf("empty errors should be skipped: %#v", err.GetErrors())
 	}
 
 	err.Add(nil, nil)
-	if len(err.GetErrors()) != 0 {
+	if err.Len() != 0 {
 		t.Errorf("empty errors should be skipped: %#v", err.GetErrors())
 	}
 
 	err0 := errors.New("foo")
 	err1 := errors.New("bar")
 	err.Add(err0, err1)
-	if len(err.GetErrors()) != 2 {
+	if err.Len() != 2 {
 		t.Errorf("Non-nil errors should be added to the batch: %v", err.GetErrors())
 	}
 	actual0 := err.GetErrors()[0]
@@ -116,7 +117,7 @@ func TestAddMultiple(t *testing.T) {
 
 	var another errorsbp.Batch
 	err.Add(another)
-	if len(err.GetErrors()) != 2 {
+	if err.Len() != 2 {
 		t.Errorf("Empty batch should be skipped: %#v", err.GetErrors())
 	}
 	err2 := errors.New("fizz")
@@ -124,7 +125,7 @@ func TestAddMultiple(t *testing.T) {
 	err4 := errors.New("alpha")
 	another.Add(err2, err3)
 	err.Add(another, err4)
-	if len(err.GetErrors()) != 5 {
+	if err.Len() != 5 {
 		t.Errorf(
 			"The underlying errors should be added instead of the batch: %#v",
 			err.GetErrors(),
@@ -225,12 +226,12 @@ func TestAddPrefix(t *testing.T) {
 	err2 := errors.New(msg2)
 
 	batch.AddPrefix(prefix1, nil)
-	if len(batch.GetErrors()) != 0 {
+	if batch.Len() != 0 {
 		t.Errorf("Nil errors should be skipped: %#v", batch.GetErrors())
 	}
 
 	batch.AddPrefix(prefix1, err0)
-	if len(batch.GetErrors()) != 1 {
+	if batch.Len() != 1 {
 		t.Errorf("Non-nil errors should be added to the batch: %#v", batch.GetErrors())
 	}
 
@@ -263,5 +264,184 @@ func TestAddPrefix(t *testing.T) {
 		if err.Error() != expectedMsgs[i] {
 			t.Errorf("Expected %dth error to be %q, got %v", i, expectedMsgs[i], err)
 		}
+	}
+}
+
+type simpleBatch []error
+
+func (sb simpleBatch) Unwrap() []error {
+	return []error(sb)
+}
+
+func (sb simpleBatch) Error() string {
+	return fmt.Sprintf("simpleBatch-%d", len(sb))
+}
+
+func TestBatchSize(t *testing.T) {
+	for _, c := range []struct {
+		label string
+		err   error
+		want  int
+	}{
+		{
+			label: "nil",
+			err:   nil,
+			want:  0,
+		},
+		{
+			label: "errors.New",
+			err:   errors.New("foo"),
+			want:  1,
+		},
+		{
+			label: "fmt.Errorf-wrap-single",
+			err:   fmt.Errorf("bar: %w", errors.New("foo")),
+			want:  1,
+		},
+		{
+			label: "batch-0",
+			err:   new(errorsbp.Batch),
+			want:  0,
+		},
+		{
+			label: "batch-1",
+			want:  1,
+			err: func() error {
+				var batch errorsbp.Batch
+				batch.Add(errors.New("foo"))
+				return batch
+			}(),
+		},
+		{
+			label: "batch-1-wrapped",
+			want:  1,
+			err: func() error {
+				var batch errorsbp.Batch
+				batch.Add(errors.New("foo"))
+				return fmt.Errorf("%w", batch)
+			}(),
+		},
+		{
+			label: "batch-2",
+			want:  2,
+			err: func() error {
+				var batch errorsbp.Batch
+				batch.Add(errors.New("foo"))
+				batch.Add(errors.New("bar"))
+				return batch
+			}(),
+		},
+		{
+			label: "batch-2-wrapped",
+			want:  2,
+			err: func() error {
+				var batch errorsbp.Batch
+				batch.Add(errors.New("foo"))
+				batch.Add(errors.New("bar"))
+				return fmt.Errorf("%w", batch)
+			}(),
+		},
+		{
+			label: "recursion",
+			want:  5,
+			err: fmt.Errorf("%w", simpleBatch{
+				nil,                            // 0
+				fmt.Errorf("%w", nil),          // 1
+				errors.New("foo"),              // 1
+				simpleBatch{errors.New("foo")}, // 1
+				fmt.Errorf("%w", simpleBatch{
+					nil,               // 0
+					errors.New("foo"), // 1
+					errors.New("bar"), // 1
+				}),
+				nil, // 0
+			}),
+		},
+		{
+			label: "errors-join",
+			want:  3,
+			err: errors.Join(
+				errors.New("foo"),
+				errors.New("bar"),
+				errors.New("fizz"),
+			),
+		},
+		{
+			label: "recursion-errors-join",
+			want:  5,
+			err: errors.Join(
+				nil,                            // 0
+				fmt.Errorf("%w", nil),          // 1
+				errors.New("foo"),              // 1
+				simpleBatch{errors.New("foo")}, // 1
+				errors.Join(
+					nil,               // 0
+					errors.New("foo"), // 1
+					errors.New("bar"), // 1
+				),
+				nil, // 0
+			),
+		},
+		{
+			label: "fmt.Errorf",
+			want:  2,
+			err: fmt.Errorf(
+				"1: %w, 2: %w",
+				errors.New("foo"),
+				errors.New("bar"),
+			),
+		},
+	} {
+		t.Run(c.label, func(t *testing.T) {
+			if got := errorsbp.BatchSize(c.err); got != c.want {
+				t.Errorf("errorsbp.BatchSize(%#v) got %v want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestPrefix(t *testing.T) {
+	for _, c := range []struct {
+		label   string
+		orig    error
+		prefix  string
+		wantMsg string
+	}{
+		{
+			label: "nil",
+		},
+		{
+			label:   "empty-prefix",
+			orig:    errors.New("foo"),
+			wantMsg: "foo",
+		},
+		{
+			label:   "normal",
+			orig:    errors.New("foo"),
+			prefix:  "bar",
+			wantMsg: "bar: foo",
+		},
+	} {
+		t.Run(c.label, func(t *testing.T) {
+			err := errorsbp.Prefix(c.prefix, c.orig)
+			if c.orig == nil {
+				if err != nil {
+					t.Errorf("Want nil error when orig is nil, got %v", err)
+				}
+				return
+			}
+			if got, want := err.Error(), c.wantMsg; got != want {
+				t.Errorf("Got error message %q, want %q", got, want)
+			}
+			if c.prefix == "" {
+				if err != c.orig {
+					t.Errorf("Got %v (%p), want %v (%p)", err, err, c.orig, c.orig)
+				}
+			} else {
+				if !errors.Is(err, c.orig) {
+					t.Errorf("errors.Is(%v, %v) is false", err, c.orig)
+				}
+			}
+		})
 	}
 }

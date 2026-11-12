@@ -10,6 +10,8 @@ import (
 )
 
 // Configuration values for the message queue.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 const (
 	// Max size in bytes for a single, serialized event.
 	MaxEventSize = 102400
@@ -20,9 +22,6 @@ const (
 	// Prefix added to the message queue name.
 	QueueNamePrefix = "events-"
 
-	// The default MaxPutTimeout to be used.
-	DefaultMaxPutTimeout = time.Millisecond * 50
-
 	// The default message queue name for v2 events.
 	DefaultV2Name = "v2"
 )
@@ -30,41 +29,51 @@ const (
 var serializerPool = thrift.NewTSerializerPoolSizeFactory(MaxEventSize, thrift.NewTJSONProtocolFactory())
 
 // A Queue is an event queue.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 type Queue struct {
 	queue      mqsend.MessageQueue
 	maxTimeout time.Duration
 }
 
 // The Config used to initialize an event queue.
+//
+// Can be deserialized from YAML.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 type Config struct {
 	// The name of the message queue, should not contain the "events-" prefix.
 	//
 	// For v2 events, the default name (when passed in Name is empty) is "v2".
-	Name string
+	Name string `yaml:"name"`
 
 	// The max timeout applied to Put function.
 	//
 	// If the passed in context object already has an earlier deadline set,
 	// that deadline will be respected instead.
-	// But if the passed in context is already canceled,
-	// then we ignore it and create a new background context with this timeout.
 	//
-	// If MaxPutTimeout <= 0, DefaultMaxPutTimeout will be used instead.
-	MaxPutTimeout time.Duration
+	// If MaxPutTimeout <= 0,
+	// Put function would run in non-blocking mode,
+	// that it fails immediately if the queue is full.
+	MaxPutTimeout time.Duration `yaml:"maxPutTimeout"`
 
 	// The max size of the message queue (number of messages).
 	//
 	// If it <=0 or > MaxQueueSize (the constant, 10000),
 	// MaxQueueSize constant will be used instead.
-	MaxQueueSize int64
+	MaxQueueSize int64 `yaml:"maxQueueSize"`
 }
 
 // V2 initializes a new v2 event queue with default configurations.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 func V2() (*Queue, error) {
 	return V2WithConfig(Config{})
 }
 
 // V2WithConfig initializes a new v2 event queue.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 func V2WithConfig(cfg Config) (*Queue, error) {
 	name := cfg.Name
 	if name == "" {
@@ -85,31 +94,25 @@ func V2WithConfig(cfg Config) (*Queue, error) {
 }
 
 func v2WithConfig(cfg Config, queue mqsend.MessageQueue) *Queue {
-	maxTimeout := cfg.MaxPutTimeout
-	if maxTimeout <= 0 {
-		maxTimeout = DefaultMaxPutTimeout
-	}
-
 	return &Queue{
 		queue:      queue,
-		maxTimeout: maxTimeout,
+		maxTimeout: cfg.MaxPutTimeout,
 	}
 }
 
 // Close closes the event queue.
 //
 // After Close is called, all Put calls will return errors.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 func (q *Queue) Close() error {
 	return q.queue.Close()
 }
 
 // Put serializes and puts an event into the event queue.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
 func (q *Queue) Put(ctx context.Context, event thrift.TStruct) error {
-	if ctx.Err() != nil {
-		// The request context is already canceled,
-		// use background to make sure we are still able to send out events.
-		ctx = context.Background()
-	}
 	ctx, cancel := context.WithTimeout(ctx, q.maxTimeout)
 	defer cancel()
 
@@ -119,4 +122,18 @@ func (q *Queue) Put(ctx context.Context, event thrift.TStruct) error {
 	}
 
 	return q.queue.Send(ctx, data)
+}
+
+// PutRaw puts a raw, already properly serialized event into the event queue.
+//
+// In most cases you should use Put instead.
+// This is only provided for some special cases like experiments-v2 custom
+// exposers.
+//
+// Deprecated: This package is in maintenance mode. Use alternative event publishing solutions.
+func (q *Queue) PutRaw(ctx context.Context, rawEvent []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, q.maxTimeout)
+	defer cancel()
+
+	return q.queue.Send(ctx, rawEvent)
 }

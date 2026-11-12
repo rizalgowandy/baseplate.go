@@ -20,17 +20,7 @@ type Config struct {
 	Endpoint string `yaml:"endpoint"`
 
 	// Tags are the base tags that will be applied to all metrics.
-	Tags Tags `yaml:"tags"`
-
-	// DEPRECATED: There's not really a reason to sample counters in Baseplate.go
-	// as they are always aggregated in memory. This config will be removed in a
-	// future release.
-	//
-	// CounterSampleRate is the fraction of counters that you want to send to your
-	// metrics backend.
-	//
-	// Optional, defaults to 1 (100%).
-	CounterSampleRate *float64 `yaml:"counterSampleRate"`
+	Tags Tags `yaml:"tags,omitempty"`
 
 	// HistogramSampleRate is the fraction of histograms (including timings) that
 	// you want to send to your metrics  backend.
@@ -38,10 +28,44 @@ type Config struct {
 	// Optional, defaults to 1 (100%).
 	HistogramSampleRate *float64 `yaml:"histogramSampleRate"`
 
+	// When Endpoint is configured,
+	// BufferSize can be used to buffer writes to statsd collector together.
+	//
+	// Set it to an appropriate number will reduce the number of UDP messages sent
+	// to the statsd collector. (Recommendation: 4KB)
+	//
+	// It's guaranteed that every single UDP message will not exceed BufferSize,
+	// unless a single metric line exceeds it
+	// (usually around 100 bytes depending on the length of the metric path).
+	//
+	// When it's 0 (default), DefaultBufferSize will be used.
+	//
+	// To disable buffering, set it to negative value (e.g. -1) or a value smaller
+	// than a single statsd metric line (usually around 100, so 1 works),
+	// on ReporterTickerInterval we will write one UDP message per metric to the
+	// statsd collector.
+	BufferSize int `yaml:"bufferSize"`
+
+	// The log level used by the reporting goroutine.
+	LogLevel log.Level `yaml:"logLevel"`
+
 	// RunSysStats indicates that you want to publish system stats.
 	//
-	// Optional, defaults to false.
+	// Optional, default to false.
 	RunSysStats bool `yaml:"runSysStats"`
+
+	// By default, when Endpoint is empty,
+	// the Statsd uses a blackhole sink to send statsd metrics to.
+	// Set this to true to buffer all statsd metrics in memory until they are read
+	// explicitly (via Statsd.WriteTo).
+	//
+	// This is provided only for tests to verify the statsd metrics.
+	// Using it in production code with empty Endpoint will cause the memory used
+	// by Statsd to grow unbounded over the time.
+	// It also has no effects when Endpoint is non-empty.
+	//
+	// Optional, default to false.
+	BufferInMemoryForTesting bool `yaml:"-"`
 }
 
 // InitFromConfig initializes the global metricsbp.M with the given context and
@@ -51,14 +75,7 @@ type Config struct {
 // It also registers CreateServerSpanHook and ConcurrencyCreateServerSpanHook
 // with the global tracing hook registry.
 func InitFromConfig(ctx context.Context, cfg Config) io.Closer {
-	M = NewStatsd(ctx, StatsdConfig{
-		CounterSampleRate:   cfg.CounterSampleRate,
-		HistogramSampleRate: cfg.HistogramSampleRate,
-		Prefix:              cfg.Namespace,
-		Address:             cfg.Endpoint,
-		LogLevel:            log.ErrorLevel,
-		Tags:                cfg.Tags,
-	})
+	M = NewStatsd(ctx, cfg)
 	tracing.RegisterCreateServerSpanHooks(CreateServerSpanHook{Metrics: M})
 	if cfg.RunSysStats {
 		M.RunSysStats()

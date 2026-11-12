@@ -1,11 +1,13 @@
 package secrets
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-
-	"github.com/reddit/baseplate.go/errorsbp"
+	"io/fs"
+	"path/filepath"
 )
 
 const (
@@ -28,6 +30,95 @@ func (s Secret) IsEmpty() bool {
 	return len(s) == 0
 }
 
+// CSIFile represents the raw parsed object of a file made by the Vault CSI
+// provider. The shape mirrors the Vault HTTP API envelope.
+//
+// The Secret field holds the user-visible secret payload. The exact wire
+// format under the top-level "data" key depends on which KV backend version
+// Vault read from:
+//
+//   - KV v1: data is the secret payload directly, e.g.
+//     {"data": {"value": "..."}}
+//   - KV v2: data has an extra layer of nesting, splitting the user payload
+//     from per-version metadata, e.g.
+//     {"data": {"data": {"value": "..."}, "metadata": {"version": 1, ...}}}
+//
+// UnmarshalJSON hides this distinction from callers by hoisting the inner
+// data field out of a KV v2 envelope, so Secret is always populated from the
+// user payload regardless of which backend Vault served the secret from.
+type CSIFile struct {
+	Secret GenericSecret `json:"data"`
+}
+
+// UnmarshalJSON decodes the CSI envelope and, when the payload was sourced
+// from Vault's KV v2 backend, hoists the inner "data" object up so that
+// Secret is decoded from the user-visible secret payload.
+//
+// A payload is treated as KV v2 when the top-level "data" is a JSON object
+// containing both a "data" key and a "metadata" object whose:
+//
+//   - "version" is a JSON number literal, AND
+//   - "created_time" is a non-empty JSON string literal.
+//
+// Both signals must come from Vault's KV v2 implementation; checking the
+// shapes of the metadata fields (rather than just their key names) avoids
+// misclassifying a KV v1 secret that happens to define user-level keys
+// called "data" and "metadata".
+func (c *CSIFile) UnmarshalJSON(b []byte) error {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		return err
+	}
+
+	if len(envelope.Data) == 0 {
+		return nil
+	}
+
+	payload := envelope.Data
+	var probe struct {
+		Data     json.RawMessage `json:"data"`
+		Metadata struct {
+			Version     json.RawMessage `json:"version"`
+			CreatedTime json.RawMessage `json:"created_time"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(payload, &probe); err == nil {
+		if len(probe.Data) > 0 &&
+			isJSONNumber(probe.Metadata.Version) &&
+			isNonEmptyJSONString(probe.Metadata.CreatedTime) {
+			payload = probe.Data
+		}
+	}
+	// If the inner Unmarshal failed, the payload is not a JSON object (string,
+	// number, array, ...). Leave it untouched; the decode into GenericSecret
+	// below will surface a useful error.
+
+	return json.Unmarshal(payload, &c.Secret)
+}
+
+// isJSONNumber reports whether b is a JSON number literal.
+//
+// We avoid encoding/json's json.Number type for this check because it accepts
+// JSON strings whose contents parse as a number (e.g. "1"), which would let a
+// caller-controlled string field masquerade as a Vault-emitted KV v2 version.
+func isJSONNumber(b []byte) bool {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 {
+		return false
+	}
+	c := b[0]
+	return c == '-' || (c >= '0' && c <= '9')
+}
+
+// isNonEmptyJSONString reports whether b is a JSON string literal with at
+// least one character of content (i.e. not "").
+func isNonEmptyJSONString(b []byte) bool {
+	b = bytes.TrimSpace(b)
+	return len(b) >= 3 && b[0] == '"' && b[len(b)-1] == '"'
+}
+
 // Secrets allows to access secrets based on their different type.
 type Secrets struct {
 	simpleSecrets     map[string]SimpleSecret
@@ -43,6 +134,22 @@ func (s *Secrets) GetSimpleSecret(path string) (SimpleSecret, error) {
 	}
 	secret, ok := s.simpleSecrets[path]
 	if !ok {
+		_, ok := s.versionedSecrets[path]
+		if ok {
+			return secret, SecretWrongTypeError{
+				Path:         path,
+				DeclaredType: SimpleType,
+				CorrectType:  VersionedType,
+			}
+		}
+		_, ok = s.credentialSecrets[path]
+		if ok {
+			return secret, SecretWrongTypeError{
+				Path:         path,
+				DeclaredType: SimpleType,
+				CorrectType:  CredentialType,
+			}
+		}
 		return secret, SecretNotFoundError(path)
 	}
 
@@ -56,6 +163,22 @@ func (s *Secrets) GetVersionedSecret(path string) (VersionedSecret, error) {
 	}
 	secret, ok := s.versionedSecrets[path]
 	if !ok {
+		_, ok := s.simpleSecrets[path]
+		if ok {
+			return secret, SecretWrongTypeError{
+				Path:         path,
+				DeclaredType: VersionedType,
+				CorrectType:  SimpleType,
+			}
+		}
+		_, ok = s.credentialSecrets[path]
+		if ok {
+			return secret, SecretWrongTypeError{
+				Path:         path,
+				DeclaredType: VersionedType,
+				CorrectType:  CredentialType,
+			}
+		}
 		return secret, SecretNotFoundError(path)
 	}
 
@@ -70,6 +193,22 @@ func (s *Secrets) GetCredentialSecret(path string) (CredentialSecret, error) {
 	}
 	secret, ok := s.credentialSecrets[path]
 	if !ok {
+		_, ok := s.simpleSecrets[path]
+		if ok {
+			return secret, SecretWrongTypeError{
+				Path:         path,
+				DeclaredType: CredentialType,
+				CorrectType:  SimpleType,
+			}
+		}
+		_, ok = s.versionedSecrets[path]
+		if ok {
+			return secret, SecretWrongTypeError{
+				Path:         path,
+				DeclaredType: CredentialType,
+				CorrectType:  VersionedType,
+			}
+		}
 		return secret, SecretNotFoundError(path)
 	}
 
@@ -192,28 +331,28 @@ type Document struct {
 // When this function returns a non-nil error, the error is either a
 // TooManyFieldsError, or a BatchError containing multiple TooManyFieldsError.
 func (s *Document) Validate() error {
-	var batch errorsbp.Batch
+	errs := make([]error, 0, len(s.Secrets))
 	for key, value := range s.Secrets {
 		if value.Type == SimpleType && notOnlySimpleSecret(value) {
-			batch.Add(TooManyFieldsError{
+			errs = append(errs, TooManyFieldsError{
 				SecretType: SimpleType,
 				Key:        key,
 			})
 		}
 		if value.Type == VersionedType && notOnlyVersionedSecret(value) {
-			batch.Add(TooManyFieldsError{
+			errs = append(errs, TooManyFieldsError{
 				SecretType: VersionedType,
 				Key:        key,
 			})
 		}
 		if value.Type == CredentialType && notOnlyCredentialSecret(value) {
-			batch.Add(TooManyFieldsError{
+			errs = append(errs, TooManyFieldsError{
 				SecretType: CredentialType,
 				Key:        key,
 			})
 		}
 	}
-	return batch.Compile()
+	return errors.Join(errs...)
 }
 
 func notOnlySimpleSecret(secret GenericSecret) bool {
@@ -258,15 +397,28 @@ func NewSecrets(r io.Reader) (*Secrets, error) {
 		return nil, err
 	}
 
-	err = secretsDocument.Validate()
+	return secretsValidate(secretsDocument)
+}
+
+// FromDir parses a directory and returns its secrets
+func FromDir(dir fs.FS) (*Secrets, error) {
+	secretsDocument, err := walkCSIDirectory(dir)
 	if err != nil {
 		return nil, err
 	}
+	return secretsValidate(secretsDocument)
+
+}
+
+func secretsValidate(secretsDocument Document) (*Secrets, error) {
 	secrets := &Secrets{
 		simpleSecrets:     make(map[string]SimpleSecret),
 		versionedSecrets:  make(map[string]VersionedSecret),
 		credentialSecrets: make(map[string]CredentialSecret),
 		vault:             secretsDocument.Vault,
+	}
+	if err := secretsDocument.Validate(); err != nil {
+		return nil, err
 	}
 	for key, secret := range secretsDocument.Secrets {
 		switch secret.Type {
@@ -297,4 +449,66 @@ func NewSecrets(r io.Reader) (*Secrets, error) {
 		}
 	}
 	return secrets, nil
+}
+
+type notCSIError struct {
+	err error
+}
+
+func (e notCSIError) Error() string {
+	return fmt.Sprintf("configured directory does not appear to be the root of a Vault CSI mount point: %v", e.err)
+}
+
+func (e notCSIError) Unwrap() error {
+	return e.err
+}
+
+// walkCSIDirectory parses a directory for vault secrets and merges them into one object
+func walkCSIDirectory(dir fs.FS) (Document, error) {
+	const (
+		// This is where k8s actually writes the content,
+		// ref: https://pkg.go.dev/sigs.k8s.io/secrets-store-csi-driver/pkg/util/fileutil#AtomicWriter.Write
+		k8sSubdirectory = "..data"
+	)
+	secretsDocument := Document{
+		Secrets: make(map[string]GenericSecret),
+	}
+	err := fs.WalkDir(
+		dir,
+		k8sSubdirectory,
+		func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if path == k8sSubdirectory && errors.Is(err, fs.ErrNotExist) {
+					return notCSIError{err: err}
+				}
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			relPath, err := filepath.Rel(k8sSubdirectory, path)
+			if err != nil {
+				// Should not happen as this means path is not under k8sSubdirectory,
+				// but just in case
+				return nil
+			}
+			file, err := dir.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			var secretFile CSIFile
+			err = json.NewDecoder(file).Decode(&secretFile)
+			if err != nil {
+				return fmt.Errorf("decoding %q: %w", path, err)
+			}
+			secretsDocument.Secrets[relPath] = secretFile.Secret
+			return nil
+		},
+	)
+	if err != nil {
+		return Document{}, fmt.Errorf("secrets.walkCSIDirectory: %w", err)
+	}
+	return secretsDocument, nil
 }

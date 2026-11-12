@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/reddit/baseplate.go/tracing"
 )
@@ -17,8 +19,8 @@ type groupConsumer struct {
 
 	wg sync.WaitGroup
 
-	consumeReturned int64
-	closed          int64
+	consumeReturned atomic.Int64
+	closed          atomic.Int64
 }
 
 // newGroupConsumer creates a new group Consumer.
@@ -37,7 +39,7 @@ func (gc *groupConsumer) Consume(
 	messagesFunc ConsumeMessageFunc,
 	errorsFunc ConsumeErrorFunc,
 ) error {
-	defer atomic.StoreInt64(&gc.consumeReturned, 1)
+	defer gc.consumeReturned.Store(1)
 	gc.wg.Add(1)
 	defer gc.wg.Done()
 
@@ -57,7 +59,7 @@ func (gc *groupConsumer) Consume(
 	// gc.consumer.Consume returns when either:
 	// - rebalance happens
 	// - Close was called
-	for atomic.LoadInt64(&gc.closed) == 0 {
+	for gc.closed.Load() == 0 {
 		if err := gc.consumer.Consume(
 			context.Background(),
 			[]string{gc.cfg.Topic},
@@ -72,7 +74,7 @@ func (gc *groupConsumer) Consume(
 
 // Close closes the consumer.
 func (gc *groupConsumer) Close() error {
-	atomic.StoreInt64(&gc.closed, 1)
+	gc.closed.Store(1)
 
 	// wait for the Consume function to return
 	defer gc.wg.Wait()
@@ -80,8 +82,8 @@ func (gc *groupConsumer) Close() error {
 	return gc.consumer.Close()
 }
 
-func (gc *groupConsumer) IsHealthy() bool {
-	return atomic.LoadInt64(&gc.consumeReturned) == 0
+func (gc *groupConsumer) IsHealthy(_ context.Context) bool {
+	return gc.consumeReturned.Load() == 0
 }
 
 // GroupConsumerHandler implements sarama.ConsumerGroupHandler.
@@ -115,11 +117,14 @@ func (h GroupConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, 
 			var span *tracing.Span
 			spanName := "group-consumer." + h.Topic
 			ctx, span = tracing.StartTopLevelServerSpan(ctx, spanName)
-			defer func() {
+			defer func(start time.Time) {
+				groupConsumerTimer.With(prometheus.Labels{
+					topicLabel: h.Topic,
+				}).Observe(time.Since(start).Seconds())
 				span.FinishWithOptions(tracing.FinishOptions{
 					Ctx: ctx,
 				}.Convert())
-			}()
+			}(time.Now())
 
 			h.Callback(ctx, m)
 			session.MarkMessage(

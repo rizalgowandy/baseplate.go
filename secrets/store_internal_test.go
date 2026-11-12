@@ -2,8 +2,14 @@ package secrets
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
+	"reflect"
 	"testing"
+	"time"
+
+	"sigs.k8s.io/secrets-store-csi-driver/pkg/util/fileutil"
 
 	"github.com/reddit/baseplate.go/log"
 )
@@ -44,11 +50,7 @@ func TestNewStore(t *testing.T) {
 		},
 	}
 
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	for _, tt := range tests {
 		t.Run(
@@ -75,5 +77,236 @@ func TestNewStore(t *testing.T) {
 				}
 			},
 		)
+	}
+}
+
+func TestDirRotation(t *testing.T) {
+	const (
+		delay = 50 * time.Millisecond
+		sleep = delay * 5
+	)
+	const (
+		key1 = "secrets/foo"
+		key2 = "secrets/bar"
+
+		apiKey = `
+{
+  "request_id": "1afc3036-2282-d483-c2d4-6d483efdf16c",
+  "lease_id": "",
+  "lease_duration": 2764800,
+  "renewable": false,
+  "data": {
+    "type": "simple",
+    "value": "Y2RvVXhNMVdsTXJma3BDaHRGZ0dPYkVGSg==",
+    "encoding": "base64"
+  },
+  "warnings": null
+}
+`
+	)
+	var wantSecret = SimpleSecret{Value: Secret("cdoUxM1WlMrfkpChtFgGObEFJ")}
+
+	dir := t.TempDir()
+	writer, err := fileutil.NewAtomicWriter(dir, "")
+	if err != nil {
+		t.Fatalf("Failed to create k8s atomic writer: %v", err)
+	}
+	content := fileutil.FileProjection{
+		Data: []byte(apiKey),
+		Mode: 0777,
+	}
+	if err := writer.Write(map[string]fileutil.FileProjection{
+		key1: content,
+	}); err != nil {
+		t.Fatalf("Failed to write initial payload: %v", err)
+	}
+
+	store, err := newStore(context.Background(), delay, dir, log.TestWrapper(t))
+	if err != nil {
+		t.Fatalf("Failed to create secrets store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	t.Run("initial-payload", func(t *testing.T) {
+		const (
+			correctKey = key1
+			wrongKey   = key2
+		)
+		_, err := store.GetSimpleSecret(wrongKey)
+		if err == nil {
+			t.Errorf("Expected error when getting %q, got nil", wrongKey)
+		}
+
+		secret, err := store.GetSimpleSecret(correctKey)
+		if err != nil {
+			t.Fatalf("Expected no error when getting %q, got %v", correctKey, err)
+		}
+		if !reflect.DeepEqual(secret, wantSecret) {
+			t.Errorf("Got secret %+v, want %+v", secret, wantSecret)
+		}
+	})
+
+	t.Run("rotated-payload", func(t *testing.T) {
+		const (
+			correctKey = key2
+			wrongKey   = key1
+		)
+		if err := writer.Write(map[string]fileutil.FileProjection{
+			correctKey: content,
+		}); err != nil {
+			t.Fatalf("Failed to write rotated payload: %v", err)
+		}
+		time.Sleep(sleep)
+
+		_, err := store.GetSimpleSecret(wrongKey)
+		if err == nil {
+			t.Errorf("Expected error when getting %q, got nil", wrongKey)
+		}
+
+		secret, err := store.GetSimpleSecret(correctKey)
+		if err != nil {
+			t.Fatalf("Expected no error when getting %q, got %v", correctKey, err)
+		}
+		if !reflect.DeepEqual(secret, wantSecret) {
+			t.Errorf("Got secret %+v, want %+v", secret, wantSecret)
+		}
+	})
+
+	t.Run("rotate_back", func(t *testing.T) {
+		const (
+			correctKey = key1
+			wrongKey   = key2
+		)
+		if err := writer.Write(map[string]fileutil.FileProjection{
+			correctKey: content,
+		}); err != nil {
+			t.Fatalf("Failed to write initial payload: %v", err)
+		}
+		time.Sleep(sleep)
+
+		_, err := store.GetSimpleSecret(wrongKey)
+		if err == nil {
+			t.Errorf("Expected error when getting %q, got nil", wrongKey)
+		}
+
+		secret, err := store.GetSimpleSecret(correctKey)
+		if err != nil {
+			t.Fatalf("Expected no error when getting %q, got %v", correctKey, err)
+		}
+		if !reflect.DeepEqual(secret, wantSecret) {
+			t.Errorf("Got secret %+v, want %+v", secret, wantSecret)
+		}
+	})
+
+	t.Run("rotated-payload-again", func(t *testing.T) {
+		const (
+			correctKey = key2
+			wrongKey   = key1
+		)
+		if err := writer.Write(map[string]fileutil.FileProjection{
+			correctKey: content,
+		}); err != nil {
+			t.Fatalf("Failed to write rotated payload: %v", err)
+		}
+		time.Sleep(sleep)
+
+		_, err := store.GetSimpleSecret(wrongKey)
+		if err == nil {
+			t.Errorf("Expected error when getting %q, got nil", wrongKey)
+		}
+
+		secret, err := store.GetSimpleSecret(correctKey)
+		if err != nil {
+			t.Fatalf("Expected no error when getting %q, got %v", correctKey, err)
+		}
+		if !reflect.DeepEqual(secret, wantSecret) {
+			t.Errorf("Got secret %+v, want %+v", secret, wantSecret)
+		}
+	})
+}
+
+// TestDirRotation_KVv2 mirrors TestDirRotation's initial-payload flow but
+// the on-disk secret is wrapped in Vault's KV v2 envelope. The library
+// should hide the v1/v2 distinction from callers: walkCSIDirectory and
+// secretsValidate must succeed and produce the same SimpleSecret.
+func TestDirRotation_KVv2(t *testing.T) {
+	const (
+		delay = 50 * time.Millisecond
+		key   = "secrets/foo"
+
+		// Same secret payload as TestDirRotation's apiKey, but the inner
+		// "data" object is now wrapped in a KV v2 envelope:
+		//
+		//   {"data": {"data": {<payload>}, "metadata": {<v2 metadata>}}}
+		apiKey = `
+{
+  "request_id": "1afc3036-2282-d483-c2d4-6d483efdf16c",
+  "lease_id": "",
+  "lease_duration": 2764800,
+  "renewable": false,
+  "data": {
+    "data": {
+      "type": "simple",
+      "value": "Y2RvVXhNMVdsTXJma3BDaHRGZ0dPYkVGSg==",
+      "encoding": "base64"
+    },
+    "metadata": {
+      "version": 1,
+      "created_time": "2024-01-01T00:00:00Z",
+      "destroyed": false,
+      "deletion_time": "",
+      "custom_metadata": null
+    }
+  },
+  "warnings": null
+}
+`
+	)
+	wantSecret := SimpleSecret{Value: Secret("cdoUxM1WlMrfkpChtFgGObEFJ")}
+
+	dir := t.TempDir()
+	writer, err := fileutil.NewAtomicWriter(dir, "")
+	if err != nil {
+		t.Fatalf("Failed to create k8s atomic writer: %v", err)
+	}
+	if err := writer.Write(map[string]fileutil.FileProjection{
+		key: {Data: []byte(apiKey), Mode: 0777},
+	}); err != nil {
+		t.Fatalf("Failed to write v2 payload: %v", err)
+	}
+
+	store, err := newStore(context.Background(), delay, dir, log.TestWrapper(t))
+	if err != nil {
+		t.Fatalf("Failed to create secrets store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	secret, err := store.GetSimpleSecret(key)
+	if err != nil {
+		t.Fatalf("GetSimpleSecret(%q): %v", key, err)
+	}
+	if !reflect.DeepEqual(secret, wantSecret) {
+		t.Errorf("Got secret %+v, want %+v", secret, wantSecret)
+	}
+}
+
+func TestDirectoryError(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	t.Cleanup(cancel)
+	store, err := NewStore(ctx, dir, log.NopWrapper)
+	if err == nil {
+		store.Close()
+		t.Fatal("Expected NewStore to return an error on an empty directory, got nil")
+	}
+	t.Logf("NewStore returned error: %v", err)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Error is not %v", fs.ErrNotExist)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Error is not %v", context.Canceled)
+	}
+	if !errors.As(err, new(notCSIError)) {
+		t.Error("Error is not of type notCSIError")
 	}
 }

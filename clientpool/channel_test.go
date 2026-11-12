@@ -1,6 +1,7 @@
 package clientpool_test
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -9,8 +10,8 @@ import (
 )
 
 func TestChannelPoolInvalidConfig(t *testing.T) {
-	const min, max = 5, 1
-	_, err := clientpool.NewChannelPool(min, max, nil)
+	const min, init, max = 5, 1, 1
+	_, err := clientpool.NewChannelPool(context.Background(), min, init, max, nil)
 	if err == nil {
 		t.Errorf(
 			"NewChannelPool with min %d and max %d expected an error, got nil.",
@@ -21,51 +22,65 @@ func TestChannelPoolInvalidConfig(t *testing.T) {
 }
 
 func TestChannelPool(t *testing.T) {
-	opener := func(called *int32) clientpool.ClientOpener {
+	opener := func(called *atomic.Int32) clientpool.ClientOpener {
 		return func() (clientpool.Client, error) {
 			if called != nil {
-				atomic.AddInt32(called, 1)
+				called.Add(1)
 			}
 			return &testClient{}, nil
 		}
 	}
 
-	const min, max = 2, 5
-	var openerCalled int32
-	pool, err := clientpool.NewChannelPool(min, max, opener(&openerCalled))
+	const min, init, max = 1, 2, 5
+	var openerCalled atomic.Int32
+	pool, err := clientpool.NewChannelPool(context.Background(), min, init, max, opener(&openerCalled))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("min: %d, max: %d", min, max)
+	t.Logf("min: %d, init: %d, max: %d", min, init, max)
 
-	testPool(t, pool, &openerCalled, min, max)
+	testPool(t, pool, &openerCalled, init, max)
 }
 
 func TestChannelPoolWithOpenerFailure(t *testing.T) {
 	// In this opener, every other call will fail
 	opener := func() clientpool.ClientOpener {
-		var called int32
+		var called atomic.Int32
 		failure := errors.New("failed")
 		return func() (clientpool.Client, error) {
-			if atomic.AddInt32(&called, 1)%2 == 0 {
+			if called.Add(1)%2 == 0 {
 				return nil, failure
 			}
 			return &testClient{}, nil
 		}
 	}
 
-	const min, max = 1, 5
+	const min, init, max = 0, 2, 5
 	t.Run(
-		"new-with-min-2-should-fail-initialization",
+		"new-with-init-2-should-not-fail-initialization",
 		func(t *testing.T) {
-			_, err := clientpool.NewChannelPool(2, max, opener())
-			if err == nil {
-				t.Error("NewChannelPool with min = 2 should fail but did not.")
+			pool, err := clientpool.NewChannelPool(context.Background(), min, init, max, opener())
+			if err != nil {
+				t.Errorf(
+					"NewChannelPool with (min, init, max) = (%d, %d, %d) failed with: %v",
+					min,
+					init,
+					max,
+					err,
+				)
+			}
+			if pool == nil {
+				t.Errorf(
+					"NewChannelPool with (min, init, max) = (%d, %d, %d) should return non-nil pool",
+					min,
+					init,
+					max,
+				)
 			}
 		},
 	)
 
-	pool, err := clientpool.NewChannelPool(min, max, opener())
+	pool, err := clientpool.NewChannelPool(context.Background(), min, init, max, opener())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,14 +89,14 @@ func TestChannelPoolWithOpenerFailure(t *testing.T) {
 	t.Run(
 		"drain-the-pool",
 		func(t *testing.T) {
-			for i := 0; i < min; i++ {
+			for i := 0; i < init; i++ {
 				_, err := pool.Get()
 				if err != nil {
 					t.Errorf("pool.Get returned error: %v", err)
 				}
 			}
 
-			checkActiveAndAllocated(t, pool, min, 0)
+			checkActiveAndAllocated(t, pool, init, 0)
 		},
 	)
 
@@ -94,7 +109,7 @@ func TestChannelPoolWithOpenerFailure(t *testing.T) {
 				t.Error("pool.Get should return error, got nil")
 			}
 
-			checkActiveAndAllocated(t, pool, min, 0)
+			checkActiveAndAllocated(t, pool, init, 0)
 		},
 	)
 }

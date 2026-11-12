@@ -3,19 +3,20 @@ package baseplate_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	baseplate "github.com/reddit/baseplate.go"
+	"github.com/reddit/baseplate.go"
+	"github.com/reddit/baseplate.go/configbp"
 	"github.com/reddit/baseplate.go/ecinterface"
 	"github.com/reddit/baseplate.go/log"
-	"github.com/reddit/baseplate.go/metricsbp"
 	"github.com/reddit/baseplate.go/runtimebp"
 	"github.com/reddit/baseplate.go/secrets"
 	"github.com/reddit/baseplate.go/tracing"
@@ -95,7 +96,10 @@ func TestServe(t *testing.T) {
 	defer store.Close()
 
 	bp := baseplate.NewTestBaseplate(baseplate.NewTestBaseplateArgs{
-		Config:          baseplate.Config{StopTimeout: testTimeout},
+		Config: baseplate.Config{
+			StopTimeout: testTimeout,
+			StopDelay:   -1,
+		},
 		Store:           store,
 		EdgeContextImpl: ecinterface.Mock(),
 	})
@@ -113,7 +117,7 @@ func TestServe(t *testing.T) {
 		},
 		{
 			name:        "timeout",
-			server:      newWaitServer(t, bp, bp.Config().StopTimeout*2),
+			server:      newWaitServer(t, bp, bp.GetConfig().StopTimeout*2),
 			errExpected: context.DeadlineExceeded,
 		},
 		{
@@ -155,13 +159,76 @@ func TestServe(t *testing.T) {
 	}
 }
 
+func TestServeStopDelay(t *testing.T) {
+	t.Parallel()
+
+	const delay = 20 * time.Millisecond
+
+	store := newSecretsStore(t)
+	defer store.Close()
+
+	bp := baseplate.NewTestBaseplate(baseplate.NewTestBaseplateArgs{
+		Config: baseplate.Config{
+			StopTimeout: testTimeout,
+			StopDelay:   delay,
+		},
+		Store:           store,
+		EdgeContextImpl: ecinterface.Mock(),
+	})
+
+	ch := make(chan error)
+
+	go func() {
+		// Run Serve in a goroutine since it is blocking
+		ch <- baseplate.Serve(
+			context.Background(),
+			baseplate.ServeArgs{Server: newWaitServer(t, bp, time.Millisecond)},
+		)
+	}()
+
+	time.Sleep(time.Millisecond)
+	p, err := os.FindProcess(syscall.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now()
+	p.Signal(os.Interrupt)
+	<-ch
+	duration := time.Since(before)
+
+	if duration < delay {
+		t.Errorf("Expected graceful shutdown to take at least %v, got %v", delay, duration)
+	}
+}
+
 type timestampCloser struct {
-	ts []time.Time
+	lock sync.Mutex
+	ts   []time.Time
 }
 
 func (c *timestampCloser) Close() error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
 	c.ts = append(c.ts, time.Now())
 	return nil
+}
+
+func (c *timestampCloser) get() []time.Time {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if len(c.ts) == 0 {
+		return nil
+	}
+	ret := make([]time.Time, len(c.ts))
+	copy(ret, c.ts)
+	return ret
+}
+
+func (c *timestampCloser) GoString() string {
+	return fmt.Sprintf("timestampCloser:%#v", c.get())
 }
 
 func TestServeClosers(t *testing.T) {
@@ -171,7 +238,10 @@ func TestServeClosers(t *testing.T) {
 	defer store.Close()
 
 	bp := baseplate.NewTestBaseplate(baseplate.NewTestBaseplateArgs{
-		Config:          baseplate.Config{StopTimeout: testTimeout},
+		Config: baseplate.Config{
+			StopTimeout: testTimeout,
+			StopDelay:   -1,
+		},
 		Store:           store,
 		EdgeContextImpl: ecinterface.Mock(),
 	})
@@ -199,13 +269,15 @@ func TestServeClosers(t *testing.T) {
 
 	time.Sleep(time.Millisecond)
 	p.Signal(os.Interrupt)
-	<-ch
-
-	if len(pre.ts) != 1 {
-		t.Fatalf("Unexpected number of PreShutdown calls: expected 1, got %v", len(pre.ts))
+	if err := <-ch; err != nil {
+		t.Fatalf("Serve returned an unexpected error: %v", err)
 	}
-	if len(post.ts) != 1 {
-		t.Fatalf("Unexpected number of PostShutdown calls: expected 1, got %v", len(post.ts))
+
+	if got := pre.get(); len(got) != 1 {
+		t.Fatalf("Unexpected number of PreShutdown calls: expected 1, got %v", len(got))
+	}
+	if got := post.get(); len(got) != 1 {
+		t.Fatalf("Unexpected number of PostShutdown calls: expected 1, got %v", len(got))
 	}
 
 	if !pre.ts[0].Before(post.ts[0]) {
@@ -217,29 +289,31 @@ func TestServeClosers(t *testing.T) {
 	}
 }
 
-func float64Ptr(v float64) *float64 {
-	return &v
-}
-
 type serviceConfig struct {
+	baseplate.Config `yaml:",inline"`
+
 	Redis struct {
 		Addrs []string
-	}
+	} `yaml:"redis"`
 }
 
-func TestDecodeConfigYAML(t *testing.T) {
-	const raw = `
+func TestParseConfigYAML(t *testing.T) {
+	t.Cleanup(func() { configbp.BaseplateConfigPath = os.Getenv("BASEPLATE_CONFIG_PATH") })
+	useConfig := func(configYAML string) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(configYAML), 0666); err != nil {
+			t.Fatalf("Failed to write to tmp config file %q: %v", path, err)
+		}
+		configbp.BaseplateConfigPath = path
+	}
+
+	const validConfigYAML = `
 addr: :8080
 timeout: 30s
 stopTimeout: 30s
 
 log:
  level: info
-
-metrics:
- namespace: baseplate-test
- endpoint: metrics:8125
- histogramSampleRate: 0.01
 
 runtime:
  numProcesses:
@@ -259,21 +333,13 @@ redis:
   - redis:8000
   - redis:8001
 `
-
-	expected := baseplate.Config{
+	validConfigBaseplate := baseplate.Config{
 		Addr:        ":8080",
 		Timeout:     time.Second * 30,
 		StopTimeout: time.Second * 30,
 
 		Log: log.Config{
 			Level: "info",
-		},
-
-		Metrics: metricsbp.Config{
-			Namespace:           "baseplate-test",
-			Endpoint:            "metrics:8125",
-			CounterSampleRate:   nil,
-			HistogramSampleRate: float64Ptr(0.01),
 		},
 
 		Runtime: runtimebp.Config{
@@ -291,34 +357,47 @@ redis:
 		},
 
 		Tracing: tracing.Config{
-			Namespace:     "baseplate-test",
-			QueueName:     "test",
-			RecordTimeout: time.Millisecond,
-			SampleRate:    0.01,
+			Namespace:        "baseplate-test",
+			QueueName:        "test",
+			MaxRecordTimeout: time.Millisecond,
+			SampleRate:       0.01,
 		},
 	}
 
-	expectedServiceCfg := serviceConfig{
-		struct{ Addrs []string }{
-			Addrs: []string{
-				"redis:8000",
-				"redis:8001",
-			},
+	validConfigService := struct{ Addrs []string }{
+		Addrs: []string{
+			"redis:8000",
+			"redis:8001",
 		},
 	}
-	var serviceCfg serviceConfig
-	cfg, err := baseplate.DecodeConfigYAML(strings.NewReader(raw), &serviceCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(cfg, expected) {
-		t.Fatalf("config mismatch, expected %#v, got %#v", expected, cfg)
-	}
-	if !reflect.DeepEqual(serviceCfg, expectedServiceCfg) {
-		t.Fatalf(
-			"service config mismatch, expected %#v, got %#v",
-			expectedServiceCfg,
-			serviceCfg,
-		)
-	}
+
+	t.Run("valid_config", func(t *testing.T) {
+		useConfig(validConfigYAML)
+		var cfg serviceConfig
+		if err := baseplate.ParseConfigYAML(&cfg); err != nil {
+			t.Fatalf("valid config failed to parse: %s", err)
+		}
+		if !reflect.DeepEqual(cfg.GetConfig(), validConfigBaseplate) {
+			t.Errorf("config mismatch, expected %#v, got %#v", validConfigBaseplate, cfg.GetConfig())
+		}
+		if !reflect.DeepEqual(cfg.Redis, validConfigService) {
+			t.Errorf(
+				"service config mismatch, expected %#v, got %#v",
+				validConfigService,
+				cfg.Redis,
+			)
+		}
+	})
+
+	t.Run("extra_params", func(t *testing.T) {
+		const configWithExtraParams = validConfigYAML + `
+anotherbackend:
+  addr: someservice:9090
+`
+		useConfig(configWithExtraParams)
+		var cfg serviceConfig
+		if err := baseplate.ParseConfigYAML(&cfg); err == nil {
+			t.Error("Expected error when yaml has extra content, did not happen.")
+		}
+	})
 }

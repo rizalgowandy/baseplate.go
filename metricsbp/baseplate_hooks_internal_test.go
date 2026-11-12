@@ -19,7 +19,9 @@ func (h createServerSpanHook) OnCreateServerSpan(span *tracing.Span) error {
 func TestCountActiveRequestsHook(t *testing.T) {
 	st := NewStatsd(
 		context.Background(),
-		StatsdConfig{},
+		Config{
+			BufferInMemoryForTesting: true,
+		},
 	)
 
 	createServerHook := createServerSpanHook{

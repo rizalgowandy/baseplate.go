@@ -9,6 +9,13 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/Shopify/sarama/mocks"
+
+	"github.com/reddit/baseplate.go"
+)
+
+// Make sure that Consumer also implements baseplate.HealthChecker.
+var (
+	_ baseplate.HealthChecker = Consumer(nil)
 )
 
 func TestKafkaConsumer_Consume(t *testing.T) {
@@ -125,26 +132,28 @@ func TestKafkaConsumer_Close(t *testing.T) {
 
 func getTestMockConsumer(t *testing.T) *consumer {
 	cfg := ConsumerConfig{
-		Brokers:  []string{"127.0.0.1:9090", "127.0.0.2:9090"},
-		Topic:    "kafkabp-test",
-		ClientID: "test-mock-consumer",
+		Brokers:                      []string{"127.0.0.1:9090", "127.0.0.2:9090"},
+		Topic:                        "kafkabp-test",
+		ClientID:                     "test-mock-consumer",
+		ConsumePartitionFuncProvider: ConsumeAllPartitionsFuncProvider,
 	}
 
 	sc, _ := cfg.NewSaramaConfig()
 	c := &consumer{
-		cfg:    cfg,
-		sc:     sc,
-		offset: sc.Consumer.Offsets.Initial,
+		cfg:                       cfg,
+		sc:                        sc,
+		offset:                    sc.Consumer.Offsets.Initial,
+		partitionSelectorProvider: ConsumeAllPartitionsFuncProvider,
 	}
 	consumer, partitions := createMockConsumer(t, cfg.Topic)
-	c.consumer.Store(consumer)
-	c.partitions.Store(partitions)
+	c.consumer.Store(&consumer)
+	c.partitions.Store(&partitions)
 	return c
 }
 
-func createMockConsumer(t *testing.T, topic string) (mc *mocks.Consumer, partitions []int32) {
-	partitions = []int32{1, 2}
-	mc = mocks.NewConsumer(t, nil)
+func createMockConsumer(t *testing.T, topic string) (_ sarama.Consumer, partitions []int32) {
+	partitions = []int32{0, 1}
+	mc := mocks.NewConsumer(t, nil)
 	metaData := make(map[string][]int32)
 	metaData[topic] = partitions
 	mc.SetTopicMetadata(metaData)
@@ -154,12 +163,13 @@ func createMockConsumer(t *testing.T, topic string) (mc *mocks.Consumer, partiti
 func setupPartitionConsumers(t *testing.T, kc *consumer) (*mocks.PartitionConsumer, *mocks.PartitionConsumer) {
 	t.Helper()
 
-	mc, ok := kc.getConsumer().(*mocks.Consumer)
+	c := *kc.consumer.Load()
+	mc, ok := c.(*mocks.Consumer)
 	if !ok {
-		t.Fatalf("kc.consumer is not *mocks.Consumer. %#v", kc.consumer)
+		t.Fatalf("kc.consumer is not *mocks.Consumer. %#v", c)
 	}
-	pc := mc.ExpectConsumePartition(kc.cfg.Topic, kc.getPartitions()[0], kc.offset)
-	pc1 := mc.ExpectConsumePartition(kc.cfg.Topic, kc.getPartitions()[1], kc.offset)
+	pc := mc.ExpectConsumePartition(kc.cfg.Topic, (*kc.partitions.Load())[0], kc.offset)
+	pc1 := mc.ExpectConsumePartition(kc.cfg.Topic, (*kc.partitions.Load())[1], kc.offset)
 	return pc, pc1
 }
 

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	retry "github.com/avast/retry-go"
+	"github.com/avast/retry-go"
 
 	"github.com/reddit/baseplate.go/errorsbp"
 	"github.com/reddit/baseplate.go/retrybp"
@@ -94,23 +94,18 @@ func TestDoBatchError(t *testing.T) {
 		retry.Attempts(uint(len(errList))),
 	)
 
-	var batchErr errorsbp.Batch
-	if errors.As(err, &batchErr) {
-		if len(batchErr.GetErrors()) != len(errList) {
-			t.Errorf(
-				"wrong number of errors in %v, expected %v",
-				batchErr.GetErrors(),
-				errList,
-			)
+	if got, want := errorsbp.BatchSize(err), len(errList); got != want {
+		t.Errorf(
+			"wrong number of errors in %v, expected %v",
+			err,
+			errList,
+		)
 
-			for _, err := range errList {
-				if !errors.Is(batchErr, err) {
-					t.Errorf("%v is not wrapped by %v", err, batchErr)
-				}
+		for _, e := range errList {
+			if !errors.Is(err, e) {
+				t.Errorf("%v is not wrapped by %v", e, err)
 			}
 		}
-	} else {
-		t.Fatalf("unexpected error type %v", err)
 	}
 }
 
@@ -118,7 +113,7 @@ func TestDoContextOverridesDefaults(t *testing.T) {
 	t.Parallel()
 
 	ctx := retrybp.WithOptions(context.Background(), retry.Attempts(maxAttempts))
-	counter := &counter{}
+	var counter counter
 	retrybp.Do(
 		ctx,
 		counter.call,
@@ -144,7 +139,7 @@ func TestSingleAttempt(t *testing.T) {
 		retry.Attempts(1),
 		retry.Delay(delay),
 	)
-	duration := time.Now().Sub(start)
+	duration := time.Since(start)
 
 	// We expect that if we only make a single attempt, then the delay logic will
 	// not trigger.
@@ -153,5 +148,39 @@ func TestSingleAttempt(t *testing.T) {
 	}
 	if duration >= delay {
 		t.Errorf("did not expect to trigger delay")
+	}
+}
+
+func TestContextDeadline(t *testing.T) {
+	t.Parallel()
+
+	const (
+		delay            = time.Millisecond * 100
+		expectedAttempts = 1
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	before := time.Now()
+	var counter counter
+	retrybp.Do(
+		ctx,
+		counter.call,
+		retry.Attempts(expectedAttempts+1),
+		retrybp.FixedDelay(delay),
+		retrybp.Filters(doFilter),
+		retry.OnRetry(func(_ uint, _ error) {
+			// Cancel the context immediately after first attempt.
+			cancel()
+		}),
+	)
+	duration := time.Since(before)
+
+	if counter.calls != expectedAttempts {
+		t.Errorf("Expected to only make %d attempt, got %d", expectedAttempts, counter.calls)
+	}
+	if duration >= delay {
+		t.Errorf("Expected the whole retrybp.Do to return as soon as context is canceled, actual took %v", duration)
 	}
 }

@@ -3,15 +3,20 @@ package secrets_test
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	"sigs.k8s.io/secrets-store-csi-driver/pkg/util/fileutil"
+
+	"github.com/reddit/baseplate.go/filewatcher"
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/secrets"
 )
 
-const specificationExample = `
+const (
+	specificationExample = `
 {
 	"secrets": {
 		"secret/myservice/external-account-key": {
@@ -36,73 +41,144 @@ const specificationExample = `
 	}
 }`
 
+	externalAccountKey = `
+{
+  "request_id": "1afc3036-2282-d483-c2d4-6d483efdf16c",
+  "lease_id": "",
+  "lease_duration": 2764800,
+  "renewable": false,
+  "data": {
+    "type": "versioned",
+    "current": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU=",
+    "previous": "aHVudGVyMg=="
+  },
+  "warnings": null
+}
+`
+
+	someAPIKey = `
+{
+  "request_id": "1afc3036-2282-d483-c2d4-6d483efdf16c",
+  "lease_id": "",
+  "lease_duration": 2764800,
+  "renewable": false,
+  "data": {
+    "type": "simple",
+    "value": "Y2RvVXhNMVdsTXJma3BDaHRGZ0dPYkVGSg==",
+    "encoding": "base64"
+  },
+  "warnings": null
+}
+`
+	someDatabaseCredentials = `
+{
+  "request_id": "1afc3036-2282-d483-c2d4-6d483efdf16c",
+  "lease_id": "",
+  "lease_duration": 2764800,
+  "renewable": false,
+  "data": {
+    "type": "credential",
+    "username": "spez",
+    "password": "hunter2"
+  },
+  "warnings": null
+}
+`
+)
+
 func TestGetSimpleSecret(t *testing.T) {
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	tmpFile, err := os.CreateTemp(dir, "secrets.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpPath := tmpFile.Name()
-	tmpFile.Write([]byte(specificationExample))
-	if err := tmpFile.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name          string
-		key           string
-		expectedError error
-		expected      secrets.SimpleSecret
+	for _, tt := range []struct {
+		label string
+		setup func(t *testing.T) string
 	}{
 		{
-			name:     "specification example",
-			key:      "secret/myservice/some-api-key",
-			expected: secrets.SimpleSecret{Value: secrets.Secret("cdoUxM1WlMrfkpChtFgGObEFJ")},
-		},
-		{
-			name:          "missing key",
-			key:           "spez",
-			expectedError: secrets.SecretNotFoundError("spez"),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(
-			tt.name,
-			func(t *testing.T) {
-				store, err := secrets.NewStore(context.Background(), tmpPath, log.TestWrapper(t))
+			label: "file",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				tmpFile, err := os.CreateTemp(dir, "secrets.json")
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer store.Close()
-
-				secret, err := store.GetSimpleSecret(tt.key)
-				if tt.expectedError == nil && err != nil {
+				tmpFile.Write([]byte(specificationExample))
+				if err := tmpFile.Close(); err != nil {
 					t.Fatal(err)
 				}
-				if tt.expectedError != nil && err.Error() != tt.expectedError.Error() {
-					t.Fatalf("expected error %v, actual: %v", tt.expectedError, err)
-				}
-				if !reflect.DeepEqual(secret, tt.expected) {
-					t.Fatalf("expected %+v, actual: %+v", tt.expected, secret)
-				}
+				return tmpFile.Name()
 			},
+		},
+		{
+			label: "dir",
+			setup: func(t *testing.T) string {
+				dirCSI := t.TempDir()
+				writer, err := fileutil.NewAtomicWriter(dirCSI, "")
+				if err != nil {
+					t.Fatalf("Failed to create k8s atomic writer: %v", err)
+				}
+				if err := writer.Write(map[string]fileutil.FileProjection{
+					"secret/myservice/external-account-key": {
+						Data: []byte(externalAccountKey),
+						Mode: 0777,
+					},
+					"secret/myservice/some-api-key": {
+						Data: []byte(someAPIKey),
+						Mode: 0777,
+					},
+					"secret/myservice/some-database-credentials": {
+						Data: []byte(someDatabaseCredentials),
+						Mode: 0777,
+					},
+				}); err != nil {
+					t.Fatalf("Failed to write csi directory: %v", err)
+				}
+				return dirCSI
+			},
+		},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			path := tt.setup(t)
+			for _, tt := range []struct {
+				name          string
+				key           string
+				expectedError error
+				expected      secrets.SimpleSecret
+			}{
+				{
+					name:     "specification example",
+					key:      "secret/myservice/some-api-key",
+					expected: secrets.SimpleSecret{Value: secrets.Secret("cdoUxM1WlMrfkpChtFgGObEFJ")},
+				},
+				{
+					name:          "missing key",
+					key:           "spez",
+					expectedError: secrets.SecretNotFoundError("spez"),
+				},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					store, err := secrets.NewStore(context.Background(), path, log.TestWrapper(t))
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { store.Close() })
+
+					secret, err := store.GetSimpleSecret(tt.key)
+					if tt.expectedError == nil && err != nil {
+						t.Fatal(err)
+					}
+					if tt.expectedError != nil && err.Error() != tt.expectedError.Error() {
+						t.Fatalf("expected error %v, actual: %v", tt.expectedError, err)
+					}
+					if !reflect.DeepEqual(secret, tt.expected) {
+						t.Fatalf("expected %+v, actual: %+v", tt.expected, secret)
+					}
+				})
+			}
+		},
 		)
 	}
 }
 
 func TestGetVersionedSecret(t *testing.T) {
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
 	tmpFile, err := os.CreateTemp(dir, "secrets.json")
 	if err != nil {
 		t.Fatal(err)
@@ -160,12 +236,7 @@ func TestGetVersionedSecret(t *testing.T) {
 }
 
 func TestGetCredentialSecret(t *testing.T) {
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
 	tmpFile, err := os.CreateTemp(dir, "secrets.json")
 	if err != nil {
 		t.Fatal(err)
@@ -223,12 +294,7 @@ func TestGetCredentialSecret(t *testing.T) {
 }
 
 func TestSecretFileIsUpdated(t *testing.T) {
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
 	tmpFile, err := os.CreateTemp(dir, "secrets.json")
 	if err != nil {
 		t.Fatal(err)
@@ -276,7 +342,7 @@ func TestSecretFileIsUpdated(t *testing.T) {
 	if err := os.Rename(tmpPath2, tmpPath); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(time.Millisecond * 100)
+	time.Sleep(100*time.Millisecond + filewatcher.DefaultFSEventsDelay)
 
 	secret, err = store.GetSimpleSecret("secret/myservice/some-api-key")
 	if err != nil {
@@ -353,12 +419,7 @@ func (m *mockMiddleware) middleware(next secrets.SecretHandlerFunc) secrets.Secr
 }
 
 func TestNewStoreMiddleware(t *testing.T) {
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
 	tmpFile, err := os.CreateTemp(dir, "secrets.json")
 	if err != nil {
 		t.Fatal(err)
@@ -400,12 +461,7 @@ func TestNewStoreMiddleware(t *testing.T) {
 }
 
 func TestAddMiddleware(t *testing.T) {
-	dir, err := os.MkdirTemp("", "secret_test_")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
 	tmpFile, err := os.CreateTemp(dir, "secrets.json")
 	if err != nil {
 		t.Fatal(err)
@@ -451,4 +507,28 @@ func TestAddMiddleware(t *testing.T) {
 			additional.calls,
 		)
 	}
+}
+
+func TestNewStoreWaitBeforeAvailable(t *testing.T) {
+	const (
+		writeDelay = 200 * time.Millisecond
+		timeout    = 5 * time.Second
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.json")
+	go func() {
+		// delay create and write secrets.json file
+		// note that we must also delay creating the file here.
+		time.Sleep(writeDelay)
+		if err := os.WriteFile(path, []byte(specificationExample), 0666); err != nil {
+			t.Errorf("Failed to write %q: %v", path, err)
+		}
+	}()
+	store, err := secrets.NewStore(ctx, path, nil)
+	if err != nil {
+		t.Fatalf("NewStore failed with %v", err)
+	}
+	store.Close()
 }

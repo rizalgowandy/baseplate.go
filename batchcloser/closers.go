@@ -9,44 +9,6 @@ import (
 	"github.com/reddit/baseplate.go/errorsbp"
 )
 
-// CloseError is used to wrap the errors returned by the inner closers within a
-// BatchCloser.
-//
-// It can be used to inspect both the error that was returned and the io.Closer
-// that caused it.
-//
-// DEPRECATED: This is no longer used and will be removed in a future version.
-type CloseError struct {
-	Cause  error
-	Closer io.Closer
-}
-
-// Error implements the interface for error.
-func (err CloseError) Error() string {
-	return fmt.Sprintf("batchcloser: error closing closer %#v: %v", err.Closer, err.Cause)
-}
-
-// Unwrap implements helper interface for errors.Is.
-func (err CloseError) Unwrap() error {
-	return err.Cause
-}
-
-// As implements helper interface for errors.As.
-func (err CloseError) As(v interface{}) bool {
-	if target, ok := v.(*CloseError); ok {
-		*target = err
-		return true
-	}
-	if target, ok := v.(**CloseError); ok {
-		*target = &err
-		return true
-	}
-	if errors.As(err.Cause, v) {
-		return true
-	}
-	return false
-}
-
 type simpleCloser struct {
 	closeFunc func() error
 }
@@ -86,11 +48,11 @@ type BatchCloser struct {
 // Close implements io.Closer and closes all of it's internal io.Closer objects,
 // batching any errors into an errorsbp.Batch.
 func (bc *BatchCloser) Close() error {
-	var errs errorsbp.Batch
+	errs := make([]error, 0, len(bc.closers))
 	for _, closer := range bc.closers {
-		errs.AddPrefix(fmt.Sprintf("%#v", closer), closer.Close())
+		errs = append(errs, errorsbp.Prefix(fmt.Sprintf("%#v", closer), closer.Close()))
 	}
-	return errs.Compile()
+	return errors.Join(errs...)
 }
 
 // Add adds the given io.Closer objects to the BatchCloser.
@@ -101,8 +63,6 @@ func (bc *BatchCloser) Add(closers ...io.Closer) {
 }
 
 var (
-	_ error     = CloseError{}
-	_ error     = (*CloseError)(nil)
 	_ io.Closer = simpleCloser{}
 	_ io.Closer = (*simpleCloser)(nil)
 	_ io.Closer = (*BatchCloser)(nil)

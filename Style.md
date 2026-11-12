@@ -4,9 +4,9 @@
 
 Make sure your code passes the following tools:
 
-- `gofmt -s`
-- `golint`
 - `go vet`
+- `gofmt -s`
+- `staticcheck` (via `go install honnef.co/go/tools/cmd/staticcheck@latest`)
 
 See our [IDE/Editor setup doc](Editor.md) for ways to doing that automatically.
 
@@ -38,22 +38,10 @@ import (
 )
 ```
 
-### Exceptions
-
-In whole file examples
-(see the end of https://pkg.go.dev/testing?tab=doc#hdr-Examples),
-merge Groups 2&3.
-The reason is that whole file examples are presented in package users' point of
-view,
-and in that point of view everything under `github.com/reddit/baseplate.go` are
-also third-party packages.
-
-Please note that this exception does not include tests and normal examples.
-
 ## Rename imports
 
-When an imported package name is different from the last element of the import
-path, always rename import it to make it explicit.
+When an imported package name is different from what is implied by the
+final element(s) of the import path, rename the import it to make it explicit.
 
 Example:
 
@@ -66,11 +54,15 @@ import (
 
 ### Exceptions
 
-As recommended by go modules version design,
-in the example of `"github.com/go-redis/redis/v7"`,
-`v7` is the major version number,
-so we consider `redis` as the actual last element of import path.
-As a result there's no need to rename import it.
+The implied package name of all of the following is still "foo", and thus
+they do not need to be renamed:
+
+* `.../foo.v1`
+* `.../foo/v1`
+* `.../foo-go`
+* `.../foo.go`
+
+Most import tools already understand these conventions.
 
 ## One-per-line style
 
@@ -134,6 +126,72 @@ log.Errorw(
 )
 ```
 
+## Blank line to highlight change of logical level
+
+Sometimes two consecutive lines could be on the same indentation level but not
+the same logical level.
+This usually happens when a long `if` condition is broke into multiple lines.
+In such cases,
+please add a blank line between them to highlight the change of logical level.
+
+Example:
+
+```go
+if condition1 && condition2 &&
+	condition3 && condition4 {
+
+	// do something, note the blank line before this line.
+	foo()
+}
+```
+
+## Don't abuse multiple return values
+
+Go allows multiple return values from a function and we should in general take
+advantage that, but the number of return values should be limited to a
+reasonable number. A rule of thumb is that if you ever have the need to split
+the return values into one-per-line on the callsite like this:
+
+```go
+retval1,
+  retval2,
+  ...
+  retvalN := package.FuncWithNReturnValues(a, lot, of, args, ...)
+```
+
+Then define a struct to return will be much better:
+
+```go
+type FuncWithNReturnValuesResult struct {
+  Retval1 Retval1Type
+  Retval2 Retval2Type
+  ...
+  RetvalN RetvalNType
+}
+
+func FuncWithNReturnValues(...) FuncWithNReturnValuesResult {
+  ...
+}
+```
+
+### Exceptions
+
+In general the `error` return should not be part of the struct and still
+returned as a separate and the last value. For example:
+
+```go
+type FuncWithNReturnValuesResult struct {
+  Retval1 Retval1Type
+  Retval2 Retval2Type
+  ...
+  RetvalN RetvalNType
+}
+
+func FuncWithNReturnValuesAndError(...) (FuncWithNReturnValuesResult, error) {
+  ...
+}
+```
+
 ## Other resources
 
 For things not covered above,
@@ -142,4 +200,5 @@ Some recommended resources are:
 
 - [Effective Go](https://golang.org/doc/effective_go.html)
 - [CodeReviewComments](https://github.com/golang/go/wiki/CodeReviewComments)
+- [Google Go Style Guide](https://google.github.io/styleguide/go/)
 - [Uber Go Style Guide](https://github.com/uber-go/guide/blob/master/style.md)

@@ -6,26 +6,31 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
-	retry "github.com/avast/retry-go"
-	"github.com/go-kit/kit/metrics"
+	"github.com/avast/retry-go"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/reddit/baseplate.go/breakerbp"
 	"github.com/reddit/baseplate.go/clientpool"
 	"github.com/reddit/baseplate.go/ecinterface"
 	"github.com/reddit/baseplate.go/errorsbp"
+	"github.com/reddit/baseplate.go/internal/prometheusbpint"
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/metricsbp"
 )
 
 // DefaultPoolGaugeInterval is the fallback value to be used when
 // ClientPoolConfig.PoolGaugeInterval <= 0.
+//
+// Deprecated: Prometheus gauges are auto scraped.
 const DefaultPoolGaugeInterval = time.Second * 10
 
-// PoolError is returned by ClientPool.Call when it fails to get a client from
-// its pool.
+// PoolError is returned by ClientPool.TClient.Call when it fails to get a
+// client from its pool.
 type PoolError struct {
 	// Cause is the inner error wrapped by PoolError.
 	Cause error
@@ -57,13 +62,40 @@ type ClientPoolConfig struct {
 	//     ImageUploadService -> image-upload
 	ServiceSlug string `yaml:"serviceSlug"`
 
-	// Addr is the address of a thrift service.  Addr must be in the format
-	// "${host}:${port}"
+	// Addr is the address of a thrift service.
+	//
+	// Addr must be in one of the following formats:
+	//
+	//  - "${host}:${port}" for TCP
+	//  - "unix://${path}" for Unix Domain Socket
+	//
+	// NOTE: When using unix domain socket with an absolute path, there must be 3
+	// slashes after "unix:", with the third slash being the root. For example,
+	// "unix:///var/run/thrift.socket" means Unix Domain Socket to
+	// "/var/run/thrift.socket" (an absolute path), while
+	// "unix://var/run/thrift.socket" means Unix Domain Socket to
+	// "var/run/thrift.socket" (a relative path).
 	Addr string `yaml:"addr"`
 
-	// InitialConnections is the inital number of thrift connections created by
-	// the client pool.
-	InitialConnections int `yaml:"initialConnections"`
+	// InitialConnections is the desired inital number of thrift connections
+	// created by the client pool.
+	//
+	// If an error occurred when we try to establish the initial N connections for
+	// the pool, we log the errors on warning level,
+	// then return the pool with the <N connections we already established.
+	//
+	// If that's unacceptable, then RequiredInitialConnections can be used to set
+	// the hard requirement of minimal initial connections to be established.
+	// Note that enabling this can cause cascading failures during an outage,
+	// so it shall only be used for extreme circumstances.
+	InitialConnections         int `yaml:"initialConnections"`
+	RequiredInitialConnections int `yaml:"requiredInitialConnections"`
+	// Deprecated: InitialConnectionsFallback is always true and setting it to
+	// false won't do anything.
+	InitialConnectionsFallback bool `yaml:"initialConnectionsFallback"`
+	// Deprecated: Individual connection errors during initialization is always
+	// logged via zap logger on warning level.
+	InitialConnectionsFallbackLogger log.Wrapper `yaml:"initialConnectionsFallbackLogger,omitempty"`
 
 	// MaxConnections is the maximum number of thrift connections the client
 	// pool can maintain.
@@ -72,11 +104,30 @@ type ClientPoolConfig struct {
 	// MaxConnectionAge is the maximum duration that a pooled connection will be
 	// kept before closing in favor of a new one.
 	//
-	// If this is not set, the default duration is 5 minutes.
+	// If this is not set, the default duration is 5 minutes
+	// (see DefaultMaxConnectionAge).
 	//
 	// To disable this and keep connections in the pool indefinetly, set this to
 	// a negative value.
-	MaxConnectionAge time.Duration `yaml:"maxConnectionAge"`
+	//
+	// MaxConnectionAgeJitter is the ratio of random jitter +/- on top of
+	// MaxConnectionAge. Default to 10% (see DefaultMaxConnectionAgeJitter).
+	// For example, when MaxConnectionAge is 5min and MaxConnectionAgeJitter is
+	// 10%, the TTL of the clients would be in range of (4:30, 5:30).
+	//
+	// When this is enabled, there will be one additional goroutine per connection
+	// in the pool to do background housekeeping (to replace the expired
+	// connections). We emit thriftbp_ttlclient_connection_housekeeping_total
+	// counter with thrift_success tag to provide observalibility into the
+	// background housekeeping.
+	//
+	// Due to a Go runtime bug [1], if you use a very small MaxConnectionAge or a
+	// jitter very close to 1, the background housekeeping could cause excessive
+	// CPU overhead.
+	//
+	// [1]: https://github.com/golang/go/issues/27707
+	MaxConnectionAge       time.Duration `yaml:"maxConnectionAge"`
+	MaxConnectionAgeJitter *float64      `yaml:"maxConnectionAgeJitter"`
 
 	// ConnectTimeout and SocketTimeout are timeouts used by the underlying
 	// thrift.TSocket.
@@ -109,7 +160,9 @@ type ClientPoolConfig struct {
 
 	// Any tags that should be applied to metrics logged by the ClientPool.
 	// This includes the optional pool stats.
-	MetricsTags metricsbp.Tags `yaml:"metricsTags"`
+	//
+	// Deprecated: We no longer emit any statsd metrics so this has no effect.
+	MetricsTags metricsbp.Tags `yaml:"metricsTags,omitempty"`
 
 	// DefaultRetryOptions is the list of retry.Options to apply as the defaults
 	// for the Retry middleware.
@@ -118,7 +171,7 @@ type ClientPoolConfig struct {
 	// retry.Attempts(1).  This sets up the retry middleware but does not
 	// automatically retry any requests.  You can set retry behavior per-call by
 	// using retrybp.WithOptions.
-	DefaultRetryOptions []retry.Option
+	DefaultRetryOptions []retry.Option `yaml:"-"`
 
 	// ReportPoolStats signals to the ClientPool that it should report
 	// statistics on the underlying clientpool.Pool in a background
@@ -133,6 +186,9 @@ type ClientPoolConfig struct {
 	//
 	// The reporting goroutine is cancelled when the global metrics client
 	// context is Done.
+	//
+	// Deprecated: The statsd metrics are deprecated and the prometheus metrics
+	// are always reported.
 	ReportPoolStats bool `yaml:"reportPoolStats"`
 
 	// PoolGaugeInterval indicates how often we should update the active
@@ -140,6 +196,8 @@ type ClientPoolConfig struct {
 	//
 	// When PoolGaugeInterval <= 0 and ReportPoolStats is true,
 	// DefaultPoolGaugeInterval will be used instead.
+	//
+	// Deprecated: Not used any more. Prometheus gauges are auto scraped.
 	PoolGaugeInterval time.Duration `yaml:"poolGaugeInterval"`
 
 	// Suppress some of the errors returned by the server before sending them to
@@ -148,31 +206,34 @@ type ClientPoolConfig struct {
 	// See MonitorClientArgs.ErrorSpanSuppressor for more details.
 	//
 	// This is optional. If it's not set IDLExceptionSuppressor will be used.
-	ErrorSpanSuppressor errorsbp.Suppressor
-
-	// When InitialConnectionsFallback is set to true and an error occurred when
-	// we try to initialize the client pool, instead of returning that error,
-	// we try again with InitialConnections falls back to 0.
-	//
-	// If the fallback attempt succeeded, we log the initial error with
-	// InitialConnectionsFallbackLogger, and returns nil error.
-	// If the fallback attempt also failed, we return both errors.
-	//
-	// This is useful when the server is unstable that some connection errors are
-	// expected, so that we still try to create InitialConnections when possible,
-	// but returns an usable client pool with 0 initial connections as fallback.
-	InitialConnectionsFallback       bool        `yaml:"initialConnectionsFallback"`
-	InitialConnectionsFallbackLogger log.Wrapper `yaml:"initialConnectionsFallbackLogger"`
+	ErrorSpanSuppressor errorsbp.Suppressor `yaml:"-"`
 
 	// When BreakerConfig is non-nil,
 	// a breakerbp.FailureRatioBreaker will be created for the pool,
 	// and its middleware will be set for the pool.
-	BreakerConfig *breakerbp.Config
+	BreakerConfig *breakerbp.Config `yaml:"breakerConfig"`
 
 	// The edge context implementation. Optional.
 	//
 	// If it's not set, the global one from ecinterface.Get will be used instead.
-	EdgeContextImpl ecinterface.Interface
+	EdgeContextImpl ecinterface.Interface `yaml:"-"`
+
+	// The name for the server to identify this client,
+	// via the "User-Agent" (HeaderUserAgent) THeader.
+	//
+	// Optional. If this is empty, no "User-Agent" header will be sent.
+	ClientName string `yaml:"clientName"`
+
+	// The hostname to add as a "thrift-hostname" header.
+	//
+	// Optional. If empty, no "thrift-hostname" header will be sent.
+	ThriftHostnameHeader string `yaml:"thriftHostnameHeader"`
+
+	// Uses zlib transform in thrift THeader connections between client and
+	// server. Requires server to support zlib transform.
+	//
+	// Optional. Default is false.
+	UseZlib bool `yaml:"useZlib"`
 }
 
 // Validate checks ClientPoolConfig for any missing or erroneous values.
@@ -180,11 +241,10 @@ type ClientPoolConfig struct {
 // If this is the configuration for a baseplate service
 // BaseplateClientPoolConfig(c).Validate should be used instead.
 func (c ClientPoolConfig) Validate() error {
-	var batch errorsbp.Batch
 	if c.InitialConnections > c.MaxConnections {
-		batch.Add(ErrConfigInvalidConnections)
+		return ErrConfigInvalidConnections
 	}
-	return batch.Compile()
+	return nil
 }
 
 var tHeaderProtocolCompact = thrift.THeaderProtocolIDPtrMust(thrift.THeaderProtocolCompact)
@@ -195,10 +255,15 @@ var tHeaderProtocolCompact = thrift.THeaderProtocolIDPtrMust(thrift.THeaderProto
 // even though that's not part of the ClientPoolConfig.
 // To override this behavior, change the value from the returned TConfiguration.
 func (c ClientPoolConfig) ToTConfiguration() *thrift.TConfiguration {
+	var transforms []thrift.THeaderTransformID
+	if c.UseZlib {
+		transforms = []thrift.THeaderTransformID{thrift.TransformZlib}
+	}
 	return &thrift.TConfiguration{
 		ConnectTimeout:    c.ConnectTimeout,
 		SocketTimeout:     c.SocketTimeout,
 		THeaderProtocolID: thrift.THeaderProtocolIDPtrMust(*tHeaderProtocolCompact),
+		THeaderTransforms: transforms,
 	}
 }
 
@@ -211,17 +276,17 @@ type BaseplateClientPoolConfig ClientPoolConfig
 // This method is designated to be used when passing a configuration to
 // NewBaseplateClientPool, for NewCustomClientPool other constraints apply.
 func (c BaseplateClientPoolConfig) Validate() error {
-	var batch errorsbp.Batch
+	var errs []error
 	if c.ServiceSlug == "" {
-		batch.Add(ErrConfigMissingServiceSlug)
+		errs = append(errs, ErrConfigMissingServiceSlug)
 	}
 	if c.Addr == "" {
-		batch.Add(ErrConfigMissingAddr)
+		errs = append(errs, ErrConfigMissingAddr)
 	}
 	if c.InitialConnections > c.MaxConnections {
-		batch.Add(ErrConfigInvalidConnections)
+		errs = append(errs, ErrConfigInvalidConnections)
 	}
-	return batch.Compile()
+	return errors.Join(errs...)
 }
 
 // Client is a client object that implements both the clientpool.Client and
@@ -244,11 +309,34 @@ type Client interface {
 // You need to create a concrete thrift client for each of your goroutines,
 // but they can share the same ClientPool underneath.
 type ClientPool interface {
-	// ClientPool implements TClient by grabbing a Client from it's pool and
-	// releasing that Client after it's Call method completes.
+	// The returned TClient implements TClient by grabbing a Client from its pool
+	// and releasing that Client after its Call method completes.
 	//
-	// If Call fails to get a client from the pool, it will return PoolError.
-	// You can check the error returned by Call using:
+	// A typical example of how to use the pool is like this:
+	//
+	//     // service.NewServiceClient comes from thrift compiled go code.
+	//     // client you got here should be treated as disposable and never be
+	//     // shared between goroutines.
+	//     client := service.NewServiceClient(pool.TClient())
+	//     resp, err := client.MyEndpoint(ctx, req)
+	//
+	// Or you can create a "client factory" for the service you want to call:
+	//
+	//    type ServiceClientFactory struct {
+	//        pool thriftbp.ClientPool
+	//    }
+	//
+	//    // service.Service and service.NewServiceClient are from thrift compiled
+	//    // go code.
+	//    func (f ServiceClientFactory) Client service.Service {
+	//        return service.NewServiceClient(f.pool.TClient())
+	//    }
+	//
+	//    client := factory.Client()
+	//    resp, err := client.MyEndpoint(ctx, req)
+	//
+	// If the call fails to get a client from the pool, it will return PoolError.
+	// You can check the error returned using:
 	//
 	//     var poolErr thriftbp.PoolError
 	//     if errors.As(err, &poolErr) {
@@ -257,13 +345,13 @@ type ClientPool interface {
 	//       // It's error from the actual thrift call
 	//     }
 	//
-	// If the error is not of type PoolError that means it's returned by the
-	// Call from the actual client.
+	// If the error is not of type PoolError that means it's returned by the call
+	// from the actual client.
 	//
-	// If Call fails to release the client back to the pool,
+	// If the call fails to release the client back to the pool,
 	// it will log the error on error level but not return it to the caller.
-	// It also increases ServiceSlug+".pool-release-error" counter.
-	thrift.TClient
+	// It also increases thriftbp_client_pool_release_errors_total counter.
+	TClient() thrift.TClient
 
 	// Passthrough APIs from clientpool.Pool:
 	io.Closer
@@ -289,28 +377,45 @@ func SingleAddressGenerator(addr string) AddressGenerator {
 	}
 }
 
-// NewBaseplateClientPool returns a standard ClientPool wrapped with the
-// BaseplateDefaultClientMiddlewares plus any additional client middlewares
+// NewBaseplateClientPool calls NewBaseplateClientPoolWithContext with
+// background context. It should not be used with RequiredInitialConnections > 0.
+func NewBaseplateClientPool(cfg ClientPoolConfig, middlewares ...thrift.ClientMiddleware) (ClientPool, error) {
+	return NewBaseplateClientPoolWithContext(context.Background(), cfg, middlewares...)
+}
+
+// NewBaseplateClientPoolWithContext returns a standard ClientPool wrapped with
+// the BaseplateDefaultClientMiddlewares plus any additional client middlewares
 // passed into this function.
 //
 // It always uses SingleAddressGenerator with the server address configured in
 // cfg, and THeader+TCompact as the protocol factory.
-func NewBaseplateClientPool(cfg ClientPoolConfig, middlewares ...thrift.ClientMiddleware) (ClientPool, error) {
+//
+// If you have RequiredInitialConnections > 0, ctx passed in controls the
+// timeout of retries to hit required initial connections. Having a ctx without
+// timeout with a downed upstream could cause this function to be blocked
+// forever.
+func NewBaseplateClientPoolWithContext(ctx context.Context, cfg ClientPoolConfig, middlewares ...thrift.ClientMiddleware) (ClientPool, error) {
 	err := BaseplateClientPoolConfig(cfg).Validate()
 	if err != nil {
 		return nil, fmt.Errorf("thriftbp.NewBaseplateClientPool: %w", err)
 	}
 	defaults := BaseplateDefaultClientMiddlewares(
 		DefaultClientMiddlewareArgs{
+			Address:             cfg.Addr,
 			EdgeContextImpl:     cfg.EdgeContextImpl,
 			ServiceSlug:         cfg.ServiceSlug,
 			RetryOptions:        cfg.DefaultRetryOptions,
 			ErrorSpanSuppressor: cfg.ErrorSpanSuppressor,
 			BreakerConfig:       cfg.BreakerConfig,
+			ClientName:          cfg.ClientName,
 		},
 	)
 	middlewares = append(middlewares, defaults...)
-	return NewCustomClientPool(
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("thriftbp.NewCustomClientPool: %w", err)
+	}
+	return newClientPool(
+		ctx,
 		cfg,
 		SingleAddressGenerator(cfg.Addr),
 		thrift.NewTHeaderProtocolFactoryConf(cfg.ToTConfiguration()),
@@ -318,12 +423,30 @@ func NewBaseplateClientPool(cfg ClientPoolConfig, middlewares ...thrift.ClientMi
 	)
 }
 
-// NewCustomClientPool creates a ClientPool that uses a custom AddressGenerator
-// and TProtocolFactory wrapped with the given middleware.
-//
-// Most services will want to just use NewBaseplateClientPool, this has been
-// provided to support services that have non-standard and/or legacy needs.
+// NewCustomClientPool calls NewCustomClientPoolWithContext with background
+// context. It should not be used with RequiredInitialConnections > 0.
 func NewCustomClientPool(
+	cfg ClientPoolConfig,
+	genAddr AddressGenerator,
+	protoFactory thrift.TProtocolFactory,
+	middlewares ...thrift.ClientMiddleware,
+) (ClientPool, error) {
+	return NewCustomClientPoolWithContext(context.Background(), cfg, genAddr, protoFactory, middlewares...)
+}
+
+// NewCustomClientPoolWithContext creates a ClientPool that uses a custom
+// AddressGenerator and TProtocolFactory wrapped with the given middleware.
+//
+// Most services will want to just use NewBaseplateClientPoolWithContext, this
+// has been provided to support services that have non-standard and/or legacy
+// needs.
+//
+// If you have RequiredInitialConnections > 0, ctx passed in controls the
+// timeout of retries to hit required initial connections. Having a ctx without
+// timeout with a downed upstream could cause this function to be blocked
+// forever.
+func NewCustomClientPoolWithContext(
+	ctx context.Context,
 	cfg ClientPoolConfig,
 	genAddr AddressGenerator,
 	protoFactory thrift.TProtocolFactory,
@@ -332,63 +455,94 @@ func NewCustomClientPool(
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("thriftbp.NewCustomClientPool: %w", err)
 	}
-	return newClientPool(cfg, genAddr, protoFactory, middlewares...)
+	return newClientPool(ctx, cfg, genAddr, protoFactory, middlewares...)
+}
+
+const ThriftHostnameHeader = "thrift-hostname"
+
+// thriftHostnameHeaderMiddleware adds a `thrift-hostname` header if one was
+// specified in the configuration.
+// This middleware is always added but will only add the header is necessary.
+func thriftHostnameHeaderMiddleware(hostname string) thrift.ClientMiddleware {
+	return func(next thrift.TClient) thrift.TClient {
+		return thrift.WrappedTClient{
+			Wrapped: func(ctx context.Context, method string, args, result thrift.TStruct) (thrift.ResponseMeta, error) {
+				if hostname != "" {
+					ctx = AddClientHeader(ctx, ThriftHostnameHeader, hostname)
+				}
+				return next.Call(ctx, method, args, result)
+			},
+		}
+	}
 }
 
 func newClientPool(
+	ctx context.Context,
 	cfg ClientPoolConfig,
 	genAddr AddressGenerator,
 	proto thrift.TProtocolFactory,
 	middlewares ...thrift.ClientMiddleware,
 ) (*clientPool, error) {
+	clientPoolMaxSizeGauge.With(prometheus.Labels{
+		"thrift_pool": cfg.ServiceSlug,
+	}).Set(float64(cfg.MaxConnections))
 	tConfig := cfg.ToTConfiguration()
-	tags := cfg.MetricsTags.AsStatsdTags()
+	jitter := DefaultMaxConnectionAgeJitter
+	if cfg.MaxConnectionAgeJitter != nil {
+		jitter = *cfg.MaxConnectionAgeJitter
+	}
 	opener := func() (clientpool.Client, error) {
+		// opener is only called in 2 scenarios:
+		//
+		// 1. fill in the initial clients when initialize a client pool
+		// 2. we failed to get a open client from the pool when trying to use it,
+		//    so we have to fallback to call opener to open a new one
+		//
+		// so this counter gives us _good enough_ data (when igoring scenario 1),
+		// in combination with clientPoolGetsCounter, to understand how many client
+		// calls had to do dns on hot path.
+		clientPoolOpenerCounter.With(prometheus.Labels{
+			"thrift_pool": cfg.ServiceSlug,
+		}).Inc()
+
 		return newClient(
 			tConfig,
+			cfg.ServiceSlug,
 			cfg.MaxConnectionAge,
+			jitter,
 			genAddr,
 			proto,
 		)
 	}
 	pool, err := clientpool.NewChannelPool(
+		ctx,
+		cfg.RequiredInitialConnections,
 		cfg.InitialConnections,
 		cfg.MaxConnections,
 		opener,
 	)
 	if err != nil {
-		if cfg.InitialConnectionsFallback {
-			// do the InitialConnectionsFallback
-			var fallbackErr error
-			pool, fallbackErr = clientpool.NewChannelPool(
-				0, // initialClients
-				cfg.MaxConnections,
-				opener,
-			)
-			if fallbackErr == nil {
-				cfg.InitialConnectionsFallbackLogger.Log(
-					context.Background(),
-					"thriftbp: error initializing thrift clientpool but fallback to 0 initial connections worked. Original error: "+err.Error(),
-				)
-				err = nil
-			} else {
-				var batch errorsbp.Batch
-				batch.Add(err)
-				batch.Add(fallbackErr)
-				err = batch.Compile()
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("thriftbp: error initializing thrift clientpool: %w", err)
-		}
-	}
-	if cfg.ReportPoolStats {
-		go reportPoolStats(
-			metricsbp.M.Ctx(),
+		return nil, fmt.Errorf(
+			"thriftbp: error initializing the required number of connections in the thrift clientpool for %q: %w",
 			cfg.ServiceSlug,
-			pool,
-			cfg.PoolGaugeInterval,
-			tags,
+			err,
+		)
+	}
+
+	if err := prometheusbpint.GlobalRegistry.Register(&clientPoolGaugeExporter{
+		slug: cfg.ServiceSlug,
+		pool: pool,
+	}); err != nil {
+		// Register should never fail because clientPoolGaugeExporter.Describe is
+		// a no-op, but just in case.
+
+		return nil, fmt.Errorf(
+			"thriftbp: error registering prometheus exporter for client pool %q: %w",
+			cfg.ServiceSlug,
+			errors.Join(
+				err,
+				errorsbp.Prefix("close pool", pool.Close()),
+			),
 		)
 	}
 
@@ -396,89 +550,78 @@ func newClientPool(
 	pooledClient := &clientPool{
 		Pool: pool,
 
-		poolExhaustedCounter: metricsbp.M.Counter(
-			cfg.ServiceSlug + ".pool-exhausted",
-		).With(tags...),
-		poolClosedConnectionsCounter: metricsbp.M.Counter(
-			cfg.ServiceSlug + ".pool-closed-connections",
-		).With(tags...),
-		releaseErrorCounter: metricsbp.M.Counter(
-			cfg.ServiceSlug + ".pool-release-error",
-		).With(tags...),
+		slug: cfg.ServiceSlug,
 	}
+	middlewares = append(middlewares, thriftHostnameHeaderMiddleware(cfg.ThriftHostnameHeader))
+
 	// finish setting up the clientPool by wrapping the inner "Call" with the
 	// given middleware.
 	//
 	// pooledClient is now ready for use.
 	pooledClient.wrapCalls(middlewares...)
+
+	// Register the error prometheus counters so they can be monitored
+	labels := prometheus.Labels{
+		"thrift_pool": cfg.ServiceSlug,
+	}
+	clientPoolExhaustedCounter.With(labels)
+	clientPoolClosedConnectionsCounter.With(labels)
+	clientPoolReleaseErrorCounter.With(labels)
+
 	return pooledClient, nil
 }
 
 func newClient(
 	cfg *thrift.TConfiguration,
+	slug string,
 	maxConnectionAge time.Duration,
+	maxConnectionAgeJitter float64,
 	genAddr AddressGenerator,
 	protoFactory thrift.TProtocolFactory,
 ) (*ttlClient, error) {
-	addr, err := genAddr()
-	if err != nil {
-		return nil, fmt.Errorf("thriftbp: error getting next address for new Thrift client: %w", err)
-	}
-
-	trans, err := thrift.NewTSocketConf(addr, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("thriftbp: error building TSocket for new Thrift client: %w", err)
-	}
-
-	err = trans.Open()
-	if err != nil {
-		return nil, fmt.Errorf("thriftbp: error opening TSocket for new Thrift client: %w", err)
-	}
-
-	var client thrift.TClient
-	client = thrift.NewTStandardClient(
-		protoFactory.GetProtocol(trans),
-		protoFactory.GetProtocol(trans),
-	)
-	return newTTLClient(trans, client, maxConnectionAge), nil
-}
-
-func reportPoolStats(ctx context.Context, prefix string, pool clientpool.Pool, tickerDuration time.Duration, tags []string) {
-	activeGauge := metricsbp.M.RuntimeGauge(prefix + ".pool-active-connections").With(tags...)
-	allocatedGauge := metricsbp.M.RuntimeGauge(prefix + ".pool-allocated-clients").With(tags...)
-
-	if tickerDuration <= 0 {
-		tickerDuration = DefaultPoolGaugeInterval
-	}
-	ticker := time.NewTicker(tickerDuration)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			activeGauge.Set(float64(pool.NumActiveClients()))
-			allocatedGauge.Set(float64(pool.NumAllocated()))
+	return newTTLClient(func() (thrift.TClient, *countingDelegateTransport, error) {
+		addr, err := genAddr()
+		if err != nil {
+			return nil, nil, fmt.Errorf("thriftbp: error getting next address for new Thrift client: %w", err)
 		}
-	}
+
+		var raw thrift.TTransport
+		if path, ok := strings.CutPrefix(addr, "unix://"); ok {
+			raw = thrift.NewTSocketFromAddrConf(&net.UnixAddr{
+				Net:  "unix",
+				Name: path,
+			}, cfg)
+		} else {
+			raw = thrift.NewTSocketConf(addr, cfg)
+		}
+		transport := &countingDelegateTransport{
+			TTransport: raw,
+		}
+		if err := transport.Open(); err != nil {
+			return nil, nil, fmt.Errorf("thriftbp: error opening TSocket to %q for new Thrift client: %w", addr, err)
+		}
+
+		return thrift.NewTStandardClient(
+			protoFactory.GetProtocol(transport),
+			protoFactory.GetProtocol(transport),
+		), transport, nil
+	}, maxConnectionAge, maxConnectionAgeJitter, slug)
 }
 
 type clientPool struct {
 	clientpool.Pool
 
-	poolExhaustedCounter         metrics.Counter
-	releaseErrorCounter          metrics.Counter
-	poolClosedConnectionsCounter metrics.Counter
+	slug string
 
 	wrappedClient thrift.TClient
 }
 
-func (p *clientPool) Call(ctx context.Context, method string, args, result thrift.TStruct) (thrift.ResponseMeta, error) {
+func (p *clientPool) TClient() thrift.TClient {
 	// A clientPool needs to be set up properly before it can be used,
 	// specifically use p.wrapCalls to set up p.wrappedClient before using it.
 	//
 	// newClientPool already takes care of this for you.
-	return p.wrappedClient.Call(ctx, method, args, result)
+	return p.wrappedClient
 }
 
 // wrapCalls wraps p.pooledCall in the given middleware and sets p.wrappedClient
@@ -507,9 +650,16 @@ func (p *clientPool) pooledCall(ctx context.Context, method string, args, result
 	}
 	defer func() {
 		if shouldCloseConnection(err) {
-			p.poolClosedConnectionsCounter.Add(1)
+			clientPoolClosedConnectionsCounter.With(prometheus.Labels{
+				"thrift_pool": p.slug,
+			}).Inc()
 			if e := client.Close(); e != nil {
-				log.Errorw("Failed to close client", "origErr", err, "closeErr", e)
+				log.C(ctx).Errorw(
+					"Failed to close client",
+					"pool", p.slug,
+					"origErr", err,
+					"closeErr", e,
+				)
 			}
 		}
 		p.releaseClient(client)
@@ -518,13 +668,25 @@ func (p *clientPool) pooledCall(ctx context.Context, method string, args, result
 	return client.Call(ctx, method, args, result)
 }
 
-func (p *clientPool) getClient() (Client, error) {
+func (p *clientPool) getClient() (_ Client, err error) {
+	defer func() {
+		clientPoolGetsCounter.With(prometheus.Labels{
+			"thrift_pool":    p.slug,
+			"thrift_success": strconv.FormatBool(err == nil),
+		}).Inc()
+	}()
 	c, err := p.Pool.Get()
 	if err != nil {
 		if errors.Is(err, clientpool.ErrExhausted) {
-			p.poolExhaustedCounter.Add(1)
+			clientPoolExhaustedCounter.With(prometheus.Labels{
+				"thrift_pool": p.slug,
+			}).Inc()
 		}
-		log.Errorw("Failed to get client from pool", "err", err)
+		log.Errorw(
+			"Failed to get client from pool",
+			"pool", p.slug,
+			"err", err,
+		)
 		return nil, err
 	}
 	return c.(Client), nil
@@ -532,8 +694,14 @@ func (p *clientPool) getClient() (Client, error) {
 
 func (p *clientPool) releaseClient(c Client) {
 	if err := p.Pool.Release(c); err != nil {
-		log.Errorw("Failed to release client back to pool", "err", err)
-		p.releaseErrorCounter.Add(1)
+		log.Errorw(
+			"Failed to release client back to pool",
+			"pool", p.slug,
+			"err", err,
+		)
+		clientPoolReleaseErrorCounter.With(prometheus.Labels{
+			"thrift_pool": p.slug,
+		}).Inc()
 	}
 }
 
@@ -544,22 +712,14 @@ func shouldCloseConnection(err error) bool {
 	var te thrift.TException
 	if errors.As(err, &te) {
 		switch te.TExceptionType() {
-		case thrift.TExceptionTypeApplication, thrift.TExceptionTypeProtocol, thrift.TExceptionTypeTransport:
-			// We definitely should close the connection on TTransportException.
-			// We probably don't need to close the connection on TApplicationException
-			// and TProtocolException, but just close them to be safe, as the
-			// connection might be in some weird state when those errors happen.
-			return true
 		case thrift.TExceptionTypeCompiled:
-			// For exceptions defined from the IDL, we definitely shouldn't close the
-			// connection.
+			// Exceptions defined in thrift IDL.
+			// Getting those means the roundtrip is done and response is read fully,
+			// so safe to reuse.
+			// This is the only non-nil error that the connection is safe for reuse
 			return false
 		}
 	}
-	// We should avoid reusing the client if it hits a network error.
-	// We should also actively close the connection if it's a timeout,
-	// as this helps the server side to abandon the request early.
-	return errors.As(err, new(net.Error)) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded)
+	// Everything else has different degrees of risks of reusing the connection.
+	return true
 }

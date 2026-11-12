@@ -25,10 +25,11 @@ func (mockTStruct) Write(ctx context.Context, p thrift.TProtocol) error {
 	return p.WriteMessageEnd(ctx)
 }
 
-func TestV2Put(t *testing.T) {
+func TestV2(t *testing.T) {
 	const queueSize = 100
-	const doubleTime = DefaultMaxPutTimeout * 2
-	const tripleTime = DefaultMaxPutTimeout * 3
+	const timeout = time.Millisecond * 10
+	const doubleTime = timeout * 2
+	const tripleTime = timeout * 3
 
 	// init
 	queue := mqsend.OpenMockMessageQueue(mqsend.MessageQueueConfig{
@@ -36,13 +37,15 @@ func TestV2Put(t *testing.T) {
 		MaxQueueSize:   queueSize,
 	})
 	v2 := v2WithConfig(
-		Config{},
+		Config{
+			MaxPutTimeout: timeout,
+		},
 		queue,
 	)
 
 	// put
 	var wg sync.WaitGroup
-	var failed int64
+	var failed atomic.Int64
 	const expectedFailures = 1
 	const n = queueSize + expectedFailures
 
@@ -55,13 +58,13 @@ func TestV2Put(t *testing.T) {
 			before := time.Now()
 			if err := v2.Put(ctx, mockTStruct{}); err != nil {
 				t.Log("Put failed with:", err)
-				atomic.AddInt64(&failed, 1)
+				failed.Add(1)
 			}
 			elapsed := time.Since(before)
 			if elapsed > tripleTime {
 				t.Errorf(
 					"Expected timeout at %v, actual elapsed time is %v",
-					DefaultMaxPutTimeout,
+					timeout,
 					elapsed,
 				)
 			}
@@ -69,7 +72,7 @@ func TestV2Put(t *testing.T) {
 	}
 	wg.Wait()
 
-	actualFailures := atomic.LoadInt64(&failed)
+	actualFailures := failed.Load()
 	if actualFailures != expectedFailures {
 		t.Errorf(
 			"Expected %d failed Put call, actual %d",
@@ -90,6 +93,57 @@ func TestV2Put(t *testing.T) {
 			} else {
 				if string(data) != expected {
 					t.Errorf("data expected to be %q, got %q", expected, data)
+				}
+			}
+		}()
+	}
+
+	// PutRaw
+	failed.Store(0)
+	const rawData = "hello, world"
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), doubleTime)
+			defer cancel()
+			before := time.Now()
+			if err := v2.PutRaw(ctx, []byte(rawData)); err != nil {
+				t.Log("PutRaw failed with:", err)
+				failed.Add(1)
+			}
+			elapsed := time.Since(before)
+			if elapsed > tripleTime {
+				t.Errorf(
+					"Expected timeout at %v, actual elapsed time is %v",
+					timeout,
+					elapsed,
+				)
+			}
+		}()
+	}
+	wg.Wait()
+
+	actualFailures = failed.Load()
+	if actualFailures != expectedFailures {
+		t.Errorf(
+			"Expected %d failed Put call, actual %d",
+			expectedFailures,
+			actualFailures,
+		)
+	}
+
+	// verify PutRaw data
+	for i := 0; i < queueSize; i++ {
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			data, err := queue.Receive(ctx)
+			if err != nil {
+				t.Error(err)
+			} else {
+				if string(data) != rawData {
+					t.Errorf("data expected to be %q, got %q", rawData, data)
 				}
 			}
 		}()

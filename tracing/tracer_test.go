@@ -3,13 +3,11 @@ package tracing
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"testing/quick"
 	"time"
 
-	"github.com/gofrs/uuid"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/mqsend"
@@ -18,6 +16,9 @@ import (
 const testTimeout = time.Millisecond * 100
 
 func TestTracer(t *testing.T) {
+	const timeout = time.Millisecond * 10
+	const doubleTimeout = timeout * 2
+
 	loggerFunc := func(t *testing.T) (logger log.Wrapper, called *bool) {
 		called = new(bool)
 		logger = func(_ context.Context, msg string) {
@@ -37,9 +38,9 @@ func TestTracer(t *testing.T) {
 			logger, called := loggerFunc(t)
 			defer func() {
 				CloseTracer()
-				InitGlobalTracer(TracerConfig{})
+				InitGlobalTracer(Config{})
 			}()
-			InitGlobalTracer(TracerConfig{
+			InitGlobalTracer(Config{
 				SampleRate:               1,
 				Logger:                   logger,
 				TestOnlyMockMessageQueue: recorder,
@@ -67,11 +68,12 @@ func TestTracer(t *testing.T) {
 	logger, called := loggerFunc(t)
 	defer func() {
 		CloseTracer()
-		InitGlobalTracer(TracerConfig{})
+		InitGlobalTracer(Config{})
 	}()
-	InitGlobalTracer(TracerConfig{
+	InitGlobalTracer(Config{
 		SampleRate:               1,
 		Logger:                   logger,
+		MaxRecordTimeout:         timeout,
 		TestOnlyMockMessageQueue: recorder,
 	})
 	// The above InitGlobalTracer might call the logger once for unable to get ip,
@@ -104,10 +106,10 @@ func TestTracer(t *testing.T) {
 			start := span.trace.start
 			err := span.Stop(ctx, nil)
 			duration := time.Since(start)
-			if duration > DefaultMaxRecordTimeout*2 {
+			if duration > doubleTimeout {
 				t.Errorf(
 					"Expected duration of around %v, got %v",
-					DefaultMaxRecordTimeout,
+					timeout,
 					duration,
 				)
 			}
@@ -137,52 +139,31 @@ func TestTracer(t *testing.T) {
 	)
 }
 
-func TestFakeUUIDQuick(t *testing.T) {
-	f := func(removeHyphen bool) bool {
-		tracer := Tracer{
-			uuidRemoveHyphen: removeHyphen,
+func TestHexID64Quick(t *testing.T) {
+	const expectedLength = 16
+	f := func() bool {
+		s := hexID64()
+		if len(s) != expectedLength {
+			t.Errorf("Expected id length to be %d, got %q", expectedLength, s)
 		}
-		s := tracer.fakeUUID()
-		id, err := uuid.FromString(s)
-		if err != nil {
-			t.Errorf("Failed to parse %q as uuid: %v", s, err)
-		}
-		if s != tracer.uuidToString(id) {
-			t.Errorf("fake uuid %q parsed differently as %q", s, id.String())
+		for i, char := range s {
+			if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+				t.Errorf("The %d-th char of %q is not hex", i, s)
+			}
 		}
 		return !t.Failed()
 	}
 	if err := quick.Check(f, nil); err != nil {
 		t.Error(err)
 	}
-	t.Log(new(Tracer).fakeUUID())
+	t.Log(hexID64())
 }
 
-func TestUUIDRemoveHyphenQuick(t *testing.T) {
-	tracer := Tracer{
-		useUUID:          true,
-		uuidRemoveHyphen: true,
-	}
-	f := func(useFake bool) bool {
-		var s string
-		if useFake {
-			s = tracer.newID()
-		} else {
-			s = tracer.fakeUUID()
+func BenchmarkHexID64(b *testing.B) {
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			hexID64()
 		}
-		if strings.Contains(s, "-") {
-			t.Errorf("uuid %q contains hyphen", s)
-		}
-		id, err := uuid.FromString(s)
-		if err != nil {
-			t.Errorf("Failed to parse %q as uuid: %v", s, err)
-		}
-		if s != tracer.uuidToString(id) {
-			t.Errorf("uuid %q parsed differently as %q", s, id.String())
-		}
-		return !t.Failed()
-	}
-	if err := quick.Check(f, nil); err != nil {
-		t.Error(err)
-	}
+	})
 }

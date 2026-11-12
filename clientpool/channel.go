@@ -1,49 +1,91 @@
 package clientpool
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"sync/atomic"
+	"time"
+
+	"github.com/reddit/baseplate.go/log"
+	"golang.org/x/time/rate"
 )
 
 type channelPool struct {
-	pool           chan Client
-	opener         ClientOpener
-	numActive      int32
-	initialClients int
-	maxClients     int
+	pool       chan Client
+	opener     ClientOpener
+	numActive  atomic.Int32
+	maxClients int
 }
 
 // Make sure channelPool implements Pool interface.
 var _ Pool = (*channelPool)(nil)
 
 // NewChannelPool creates a new client pool implemented via channel.
-func NewChannelPool(initialClients, maxClients int, opener ClientOpener) (Pool, error) {
-	if initialClients > maxClients {
+func NewChannelPool(ctx context.Context, requiredInitialClients, bestEffortInitialClients, maxClients int, opener ClientOpener) (_ Pool, err error) {
+	if !(requiredInitialClients <= bestEffortInitialClients && bestEffortInitialClients <= maxClients) {
 		return nil, &ConfigError{
-			InitialClients: initialClients,
-			MaxClients:     maxClients,
+			BestEffortInitialClients: bestEffortInitialClients,
+			RequiredInitialClients:   requiredInitialClients,
+			MaxClients:               maxClients,
 		}
 	}
 
+	var lastAttemptErr error
 	pool := make(chan Client, maxClients)
-	for i := 0; i < initialClients; i++ {
+	chatty := rate.NewLimiter(rate.Every(2*time.Second), 1)
+
+	defer func() {
+		if err != nil {
+			// If we are returning an error, we need to make sure that we close all
+			// already created connections
+			close(pool)
+			for c := range pool {
+				c.Close()
+			}
+		}
+	}()
+
+	for i := 0; i < requiredInitialClients; {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if lastAttemptErr == nil {
+				// In case the user sets a deadline so short that we don't have
+				// time to open all the client serially despite all of them working.
+				// In that case lastAttempErr would be nil so we need to indicate to
+				// the user that their timeout being too short is the issue.
+				lastAttemptErr = ctxErr
+			}
+			return nil, lastAttemptErr
+		}
+		c, err := opener()
+		if err == nil {
+			pool <- c
+			i++
+		} else {
+			lastAttemptErr = err
+			if chatty.Allow() {
+				log.Warnf("clientpool: error creating required client (will retry): %v", err)
+			}
+		}
+	}
+
+	for i := requiredInitialClients; i < bestEffortInitialClients; i++ {
 		c, err := opener()
 		if err != nil {
-			return nil, fmt.Errorf(
-				"error creating client #%d/%d: %w",
+			log.Warnf(
+				"clientpool: error creating best-effort client #%d/%d: %v",
 				i,
-				initialClients,
+				bestEffortInitialClients,
 				err,
 			)
+			break
 		}
 		pool <- c
 	}
 
 	return &channelPool{
-		pool:           pool,
-		opener:         opener,
-		initialClients: initialClients,
-		maxClients:     maxClients,
+		pool:       pool,
+		opener:     opener,
+		maxClients: maxClients,
 	}, nil
 }
 
@@ -51,15 +93,26 @@ func NewChannelPool(initialClients, maxClients int, opener ClientOpener) (Pool, 
 func (cp *channelPool) Get() (client Client, err error) {
 	defer func() {
 		if err == nil {
-			atomic.AddInt32(&cp.numActive, 1)
+			cp.numActive.Add(1)
 		}
 	}()
 
 	select {
-	case c := <-cp.pool:
+	case c, ok := <-cp.pool:
+		if !ok {
+			return nil, errors.New("clientpool: Get called after Close")
+		}
 		if c.IsOpen() {
 			return c, nil
 		}
+		// For thrift connections, IsOpen could return false in both explicit and
+		// implicit closed situations.
+		// In implicit closed situation, IsOpen does a connectivity check and
+		// returns false if that check fails. In such case we should still close the
+		// connection explicitly to avoid resource leak.
+		// In explicit situation, calling Close again will just return an already
+		// closed error, which is harmless here.
+		c.Close()
 	default:
 	}
 
@@ -82,9 +135,14 @@ func (cp *channelPool) Release(c Client) error {
 
 	// As long as c is not nil, we always need to decrease numActive by 1,
 	// even if we encounter errors here, either due to close or opener.
-	defer atomic.AddInt32(&cp.numActive, -1)
+	defer cp.numActive.Add(-1)
 
 	if !c.IsOpen() {
+		// Even when c.IsOpen reported false, still call Close explicitly to avoid
+		// connection leaks. At worst case scenario it just returns an already
+		// closed error, which is still harmless.
+		c.Close()
+
 		newC, err := cp.opener()
 		if err != nil {
 			return err
@@ -115,7 +173,7 @@ func (cp *channelPool) Close() error {
 
 // NumActiveClients returns the number of clients curently given out for use.
 func (cp *channelPool) NumActiveClients() int32 {
-	return atomic.LoadInt32(&cp.numActive)
+	return cp.numActive.Load()
 }
 
 // NumAllocated returns the number of allocated clients in internal pool.

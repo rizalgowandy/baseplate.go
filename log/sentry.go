@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
-	sentry "github.com/getsentry/sentry-go"
+	"github.com/getsentry/sentry-go"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -26,30 +27,33 @@ type SentryConfig struct {
 	// The Sentry DSN to use.
 	// If empty, SENTRY_DSN environment variable will be used instead.
 	// If that's also empty, then all sentry operations will be nop.
-	DSN string
+	DSN string `yaml:"dsn"`
 
 	// SampleRate between 0 and 1, default is 1.
-	SampleRate *float64
+	SampleRate *float64 `yaml:"sampleRate"`
 
 	// The name of your service.
 	//
 	// By default sentry extracts hostname reported by the kernel for this field.
 	// Set it to non-empty to override that
 	// (and hostname tag will be used to report hostname automatically).
-	ServerName string
+	ServerName string `yaml:"serverName"`
 
 	// An environment string like "prod", "staging".
-	Environment string
+	Environment string `yaml:"environment"`
 
 	// List of regexp strings that will be used to match against event's message
 	// and if applicable, caught errors type and value.
 	// If the match is found, then a whole event will be dropped.
-	IgnoreErrors []string
+	IgnoreErrors []string `yaml:"ignoreErrors,omitempty"`
 
 	// FlushTimeout is the timeout to be used to call sentry.Flush when closing
 	// the Closer returned by InitSentry.
 	// If <=0, DefaultSentryFlushTimeout will be used.
-	FlushTimeout time.Duration
+	FlushTimeout time.Duration `yaml:"flushTimeout"`
+
+	// BeforeSend is a callback modifier before emitting an event to Sentry.
+	BeforeSend func(event *sentry.Event, hint *sentry.EventHint) *sentry.Event `yaml:"-"`
 }
 
 // InitSentry initializes sentry reporting.
@@ -71,12 +75,38 @@ func InitSentry(cfg SentryConfig) (io.Closer, error) {
 	if cfg.SampleRate != nil && *cfg.SampleRate >= 0 && *cfg.SampleRate <= 1 {
 		sampleRate = *cfg.SampleRate
 	}
+
+	// Improve legibility of Sentry errors by using the error message as header
+	// instead of the error type and marking stack trace frame from
+	// baseplate.go as not in-app.
+	const (
+		base   = "github.com/reddit/baseplate.go"
+		prefix = base + "/"
+	)
+	beforeSend := func(event *sentry.Event, hint *sentry.EventHint) *sentry.Event {
+		for i, exception := range event.Exception {
+			// Mark stacktraces from baseplate.go as not in-app.
+			if exception.Stacktrace != nil {
+				for j, frame := range exception.Stacktrace.Frames {
+					if frame.Module == base || strings.HasPrefix(frame.Module, prefix) {
+						event.Exception[i].Stacktrace.Frames[j].InApp = false
+					}
+				}
+			}
+		}
+		if cfg.BeforeSend != nil {
+			return cfg.BeforeSend(event, hint)
+		}
+		return event
+	}
+
 	if err := sentry.Init(sentry.ClientOptions{
 		Dsn:          cfg.DSN,
 		SampleRate:   sampleRate,
 		ServerName:   cfg.ServerName,
 		Environment:  cfg.Environment,
 		IgnoreErrors: cfg.IgnoreErrors,
+		BeforeSend:   beforeSend,
 	}); err != nil {
 		return nil, err
 	}
@@ -93,6 +123,37 @@ func InitSentry(cfg SentryConfig) (io.Closer, error) {
 		})
 	}
 	return closer(cfg.FlushTimeout), nil
+}
+
+// SentryBeforeSendSwapExceptionTypeAndValue is a sentry.BeforeSend
+// implementation that swaps the error message and error type reported to sentry.
+//
+// See [1] for context on why doing this might be a good idea for your service.
+//
+// This is not enabled by default,
+// as it makes sentry no longer cluster errors with same type but slightly
+// different error message as the same error.
+// If you want to use this feature,
+// set SentryConfig.BeforeSend to this function.
+// If you have other things you want to do in your BeforeSend,
+// you can call this function in your BeforeSend implementation instead. e.g.:
+//
+//	sentryConfig.BeforeSend = func(event *sentry.Event, hint *sentry.EventHint) *sentry.Event {
+//	  // Do other things you want to do here.
+//
+//	  // Also do the swapping.
+//	  return log.SentryBeforeSendSwapExceptionTypeAndValue(event, hint)
+//	}
+//
+// [1]: https://github.com/getsentry/sentry-go/issues/307#issuecomment-737871530
+func SentryBeforeSendSwapExceptionTypeAndValue(event *sentry.Event, hint *sentry.EventHint) *sentry.Event {
+	if event == nil {
+		return nil
+	}
+	for i := range event.Exception {
+		event.Exception[i].Type, event.Exception[i].Value = event.Exception[i].Value, event.Exception[i].Type
+	}
+	return event
 }
 
 type closer time.Duration

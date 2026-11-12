@@ -2,25 +2,41 @@ package baseplate
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"time"
 
-	yaml "gopkg.in/yaml.v2"
-
 	"github.com/reddit/baseplate.go/batchcloser"
+	"github.com/reddit/baseplate.go/configbp"
 	"github.com/reddit/baseplate.go/ecinterface"
-	"github.com/reddit/baseplate.go/errorsbp"
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/metricsbp"
+	"github.com/reddit/baseplate.go/prometheusbp"
 	"github.com/reddit/baseplate.go/runtimebp"
 	"github.com/reddit/baseplate.go/secrets"
 	"github.com/reddit/baseplate.go/tracing"
 )
 
-// Config is a general purpose config for assembling a Baseplate server
+const (
+	// DefaultStopDelay is the default StopDelay to be used in Serve.
+	DefaultStopDelay = 5 * time.Second
+)
+
+// Configer defines the interface that allows you to extend Config with your own
+// configurations.
+type Configer interface {
+	GetConfig() Config
+}
+
+var (
+	_ Configer = Config{}
+)
+
+// Config is a general purpose config for assembling a Baseplate server.
+//
+// It implements Configer.
 type Config struct {
 	// Addr is the local address to run your server on.
 	//
@@ -28,8 +44,7 @@ type Config struct {
 	// or simply ":${Port}".
 	Addr string `yaml:"addr"`
 
-	// Timeout is the socket connection timeout for Servers that
-	// support that.
+	// Deprecated: No-op for now, will be removed in a future release.
 	Timeout time.Duration `yaml:"timeout"`
 
 	// StopTimeout is the timeout for the Stop command for the service.
@@ -38,19 +53,34 @@ type Config struct {
 	// If this is less than 0, then no timeout will be set on the Stop command.
 	StopTimeout time.Duration `yaml:"stopTimeout"`
 
+	// Delay after receiving termination signal (SIGTERM, etc.) before kicking off
+	// the graceful shutdown process. This happens before the PreShutdown closers.
+	//
+	// By default this is 1s (DefaultStopDelay).
+	// To disable it, set it to a negative value.
+	StopDelay time.Duration `yaml:"stopDelay"`
+
 	Log     log.Config       `yaml:"log"`
-	Metrics metricsbp.Config `yaml:"metrics"`
 	Runtime runtimebp.Config `yaml:"runtime"`
 	Secrets secrets.Config   `yaml:"secrets"`
 	Sentry  log.SentryConfig `yaml:"sentry"`
 	Tracing tracing.Config   `yaml:"tracing"`
+
+	// Deprecated: statsd metrics are deprecated.
+	Metrics metricsbp.Config `yaml:"metrics"`
+}
+
+// GetConfig implements Configer.
+func (c Config) GetConfig() Config {
+	return c
 }
 
 // Baseplate is the general purpose object that you build a Server on.
 type Baseplate interface {
 	io.Closer
 
-	Config() Config
+	Configer
+
 	EdgeContextImpl() ecinterface.Interface
 	Secrets() *secrets.Store
 }
@@ -130,7 +160,7 @@ func Serve(ctx context.Context, args ServeArgs) error {
 			//
 			// If one is set, we will only wait for that duration for the server to
 			// stop gracefully and will exit after the deadline is exceeded.
-			timeout := server.Baseplate().Config().StopTimeout
+			timeout := server.Baseplate().GetConfig().StopTimeout
 
 			// Default to 30 seconds if not set.
 			if timeout == 0 {
@@ -147,6 +177,11 @@ func Serve(ctx context.Context, args ServeArgs) error {
 				defer cancel()
 			}
 
+			delay := server.Baseplate().GetConfig().StopDelay
+			if delay == 0 {
+				delay = DefaultStopDelay
+			}
+
 			// Initialize a channel to pass the result of server.Close().
 			//
 			// It's buffered with size 1 to avoid blocking the goroutine forever.
@@ -156,7 +191,14 @@ func Serve(ctx context.Context, args ServeArgs) error {
 			//
 			// This is a blocking call, so it is called in a separate goroutine.
 			go func() {
-				bc := batchcloser.New(args.PreShutdown...)
+				var bc batchcloser.BatchCloser
+				if delay > 0 {
+					bc.Add(batchcloser.Wrap(func() error {
+						time.Sleep(delay)
+						return nil
+					}))
+				}
+				bc.Add(args.PreShutdown...)
 				bc.Add(server)
 				bc.Add(args.PostShutdown...)
 				closeChannel <- bc.Close()
@@ -200,70 +242,80 @@ func Serve(ctx context.Context, args ServeArgs) error {
 	return <-shutdownChannel
 }
 
-// ParseConfig returns a new Config parsed from the YAML file at the given path.
-func ParseConfig(path string, serviceCfg interface{}) (Config, error) {
-	cfg := Config{}
-	if path == "" {
-		return cfg, errors.New("baseplate.ParseConfig: no config path given")
+// ParseConfigYAML loads the baseplate config into the structed pointed to by cfgPointer.
+//
+// The configuration file is located based on the $BASEPLATE_CONFIG_PATH
+// environment variable.
+//
+// To avoid easy mistakes, "strict" mode is enabled while parsing the file,
+// which means that all values in the YAML config must have a matching
+// struct or value during decoding.
+//
+// If you don't have any customized configurations to decode from YAML,
+// you can just pass in a *pointer* to baseplate.Config:
+//
+//	var cfg baseplate.Config
+//	if err := baseplate.ParseConfigYAML(&cfg); err != nil {
+//	  log.Fatalf("Parsing config: %s", err)
+//	}
+//	ctx, bp, err := baseplate.New(baseplate.NewArgs{
+//	  EdgeContextFactory: edgecontext.Factory(...),
+//	  Config:             cfg,
+//	})
+//
+// If you do have customized configurations to decode from YAML,
+// embed a baseplate.Config with `yaml:",inline"` yaml tags, for example:
+//
+//	type myServiceConfig struct {
+//	  // The yaml tag is required to pass strict parsing.
+//	  baseplate.Config `yaml:",inline"`
+//
+//	  // Actual configs
+//	  FancyName string `yaml:"fancy_name"`
+//	}
+//	var cfg myServiceCfg
+//	if err := baseplate.ParseConfigYAML(&cfg); err != nil {
+//	  log.Fatalf("Parsing config: %s", err)
+//	}
+//	ctx, bp, err := baseplate.New(baseplate.NewArgs{
+//	  EdgeContextFactory: edgecontext.Factory(...),
+//	  Config:             cfg,
+//	})
+//
+// Environment variable references (e.g. $FOO and ${FOO}) are substituted into the
+// YAML from the process-level environment before parsing the configuration.
+func ParseConfigYAML(cfgPointer Configer) error {
+	if configbp.BaseplateConfigPath == "" {
+		return fmt.Errorf("no $BASEPLATE_CONFIG_PATH specified, cannot load config")
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return cfg, err
-	}
-	defer f.Close()
-
-	return DecodeConfigYAML(f, serviceCfg)
-}
-
-// DecodeConfigYAML returns a new Config built from decoding the YAML read from
-// the given Reader.
-func DecodeConfigYAML(reader io.ReadSeeker, serviceCfg interface{}) (Config, error) {
-	cfg := Config{}
-	if err := yaml.NewDecoder(reader).Decode(&cfg); err != nil {
-		return cfg, err
-	}
-
-	log.Debugf("%#v", cfg)
-
-	if serviceCfg != nil {
-		reader.Seek(0, io.SeekStart)
-		if err := yaml.NewDecoder(reader).Decode(serviceCfg); err != nil {
-			return cfg, err
-		}
-	}
-	return cfg, nil
+	return configbp.ParseStrictFile(configbp.BaseplateConfigPath, cfgPointer)
 }
 
 // NewArgs defines the args used in New functino.
 type NewArgs struct {
-	// Required.
-	ConfigPath string
+	// Required. New will panic if this is nil.
+	Config Configer
 
-	// Required. New will panic if this is not set.
+	// Required. New will panic if this is nil.
 	//
 	// The factory to be used to create edge context implementation.
 	EdgeContextFactory ecinterface.Factory
-
-	// Optional.
-	//
-	// If it is non-nil, it should be a pointer and New will also decode the
-	// config file at the path to set it up.
-	// This can be used to parse additional, service specific config values from
-	// the same config file.
-	ServiceCfg interface{}
 }
 
-// New parses the config file at the given path, initializes the monitoring and
-// logging frameworks, and returns the "serve" context and a new Baseplate to
-// run your service on.  The returned context will be cancelled when the
-// Baseplate is closed.
+// New initializes Baseplate libraries with the given config,
+// (logging, secrets, tracing, edge context, etc.),
+// and returns the "serve" context and a new Baseplate to
+// run your service on.
+// The returned context will be cancelled when the Baseplate is closed.
 func New(ctx context.Context, args NewArgs) (context.Context, Baseplate, error) {
-	cfg, err := ParseConfig(args.ConfigPath, args.ServiceCfg)
-	if err != nil {
-		return nil, nil, err
-	}
+	cfg := args.Config.GetConfig()
 	bp := impl{cfg: cfg, closers: batchcloser.New()}
+
+	if info, ok := debug.ReadBuildInfo(); ok {
+		prometheusbp.RecordModuleVersions(info)
+	} else {
+		log.C(ctx).Warn("baseplate.New: unable to read build info to export dependency metrics")
+	}
 
 	runtimebp.InitFromConfig(cfg.Runtime)
 
@@ -271,26 +323,37 @@ func New(ctx context.Context, args NewArgs) (context.Context, Baseplate, error) 
 	bp.closers.Add(batchcloser.WrapCancel(cancel))
 
 	log.InitFromConfig(cfg.Log)
-	bp.closers.Add(metricsbp.InitFromConfig(ctx, cfg.Metrics))
 
 	closer, err := log.InitSentry(cfg.Sentry)
 	if err != nil {
 		bp.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf(
+			"baseplate.New: failed to init sentry: %w (config: %#v)",
+			err,
+			cfg.Sentry,
+		)
 	}
 	bp.closers.Add(closer)
 
 	bp.secrets, err = secrets.InitFromConfig(ctx, cfg.Secrets)
 	if err != nil {
 		bp.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf(
+			"baseplate.New: failed to init secrets: %w (config: %#v)",
+			err,
+			cfg.Secrets,
+		)
 	}
 	bp.closers.Add(bp.secrets)
 
 	closer, err = tracing.InitFromConfig(cfg.Tracing)
 	if err != nil {
 		bp.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf(
+			"baseplate.New: failed to init tracing: %w (config: %#v)",
+			err,
+			cfg.Tracing,
+		)
 	}
 	bp.closers.Add(closer)
 
@@ -299,8 +362,12 @@ func New(ctx context.Context, args NewArgs) (context.Context, Baseplate, error) 
 	})
 	if err != nil {
 		bp.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf(
+			"baseplate.New: failed to init edge context: %w",
+			err,
+		)
 	}
+
 	return ctx, bp, nil
 }
 
@@ -311,7 +378,7 @@ type impl struct {
 	secrets *secrets.Store
 }
 
-func (bp impl) Config() Config {
+func (bp impl) GetConfig() Config {
 	return bp.cfg
 }
 
@@ -325,29 +392,11 @@ func (bp impl) EdgeContextImpl() ecinterface.Interface {
 
 func (bp impl) Close() error {
 	err := bp.closers.Close()
-
-	var errs []error
-	var batchErr errorsbp.Batch
-	if errors.As(err, &batchErr) {
-		errs = batchErr.GetErrors()
-	} else if err != nil {
-		errs = append(errs, err)
-	}
-
-	for _, batchedErr := range errs {
-		var closeErr batchcloser.CloseError
-		if errors.As(batchedErr, &closeErr) {
-			log.Errorw(
-				"Failed to close closer",
-				"err", closeErr.Unwrap(),
-				"closer", closeErr.Closer,
-			)
-		} else {
-			log.Errorw(
-				"Error while closing unknown closer",
-				"err", batchedErr,
-			)
-		}
+	if err != nil {
+		log.Errorw(
+			"Error while closing closers",
+			"err", err,
+		)
 	}
 	return err
 }

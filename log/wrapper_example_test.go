@@ -7,15 +7,29 @@ import (
 	"fmt"
 	"strings"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/metricsbp"
-	"gopkg.in/yaml.v2"
 )
 
 // ExtendedLogWrapper extends log.Wrapper to support metricsbp.LogWrapper.
 type ExtendedLogWrapper struct {
 	log.Wrapper
 }
+
+var st = metricsbp.NewStatsd(
+	context.Background(),
+	metricsbp.Config{
+		// This is to make sure that when we read the metricsbp statsd buffer out
+		// manually later in the example they are not already sent to a blackhole
+		// sink.
+		// This is NOT needed in production code as in production code the sink
+		// shall be configured as the actual statsd collector and not read out
+		// manually like in this example.
+		BufferInMemoryForTesting: true,
+	},
+)
 
 // UnmarshalText implements encoding.TextUnmarshaler.
 //
@@ -38,6 +52,7 @@ func (e *ExtendedLogWrapper) UnmarshalText(text []byte) error {
 		e.Wrapper = metricsbp.LogWrapper(metricsbp.LogWrapperArgs{
 			Counter: parts[1],
 			Wrapper: w,
+			Statsd:  st,
 		})
 		return nil
 	}
@@ -74,7 +89,7 @@ func ExampleWrapper_UnmarshalText() {
 	)
 	data.Logger.Log(context.Background(), "Hello, world!")
 	var buf bytes.Buffer
-	metricsbp.M.WriteTo(&buf)
+	st.WriteTo(&buf)
 	fmt.Printf("Counter: %s", buf.String())
 
 	// Output:

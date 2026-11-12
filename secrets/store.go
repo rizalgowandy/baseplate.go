@@ -2,7 +2,12 @@ package secrets
 
 import (
 	"context"
+	"errors"
 	"io"
+	"io/fs"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/reddit/baseplate.go/filewatcher"
 	"github.com/reddit/baseplate.go/log"
@@ -28,7 +33,11 @@ func nopSecretHandlerFunc(sec *Secrets) {}
 type Store struct {
 	watcher filewatcher.FileWatcher
 
-	secretHandlerFunc SecretHandlerFunc
+	// mutex to guard unsafeSecretHandlerFunc
+	// call handler function using the secretHandlerFunc function rather than
+	// calling unsafeSecretHandlerFunc directly
+	mu                      sync.Mutex
+	unsafeSecretHandlerFunc SecretHandlerFunc
 }
 
 // NewStore returns a new instance of Store by configuring it
@@ -38,17 +47,33 @@ type Store struct {
 // Context should come with a timeout otherwise this might block forever, i.e.
 // if the path never becomes available.
 func NewStore(ctx context.Context, path string, logger log.Wrapper, middlewares ...SecretMiddleware) (*Store, error) {
+	return newStore(ctx, 0 /* use default fsEventsDelay */, path, logger, middlewares...)
+}
+
+// Used in tests to override FSEventsDelay
+func newStore(ctx context.Context, fsEventsDelay time.Duration, path string, logger log.Wrapper, middlewares ...SecretMiddleware) (*Store, error) {
 	store := &Store{
-		secretHandlerFunc: nopSecretHandlerFunc,
+		unsafeSecretHandlerFunc: nopSecretHandlerFunc,
 	}
 	store.secretHandler(middlewares...)
+	fileInfo, err := os.Stat(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+
+	parser := store.parser
+	if fileInfo != nil && fileInfo.IsDir() {
+		parser = filewatcher.WrapDirParser(store.dirParser)
+	}
 
 	result, err := filewatcher.New(
 		ctx,
 		filewatcher.Config{
 			Path:   path,
-			Parser: store.parser,
+			Parser: parser,
 			Logger: logger,
+
+			FSEventsDelay: fsEventsDelay,
 		},
 	)
 	if err != nil {
@@ -59,8 +84,19 @@ func NewStore(ctx context.Context, path string, logger log.Wrapper, middlewares 
 	return store, nil
 }
 
-func (s *Store) parser(r io.Reader) (interface{}, error) {
+func (s *Store) parser(r io.Reader) (any, error) {
 	secrets, err := NewSecrets(r)
+	if err != nil {
+		return nil, err
+	}
+
+	s.secretHandlerFunc(secrets)
+
+	return secrets, nil
+}
+
+func (s *Store) dirParser(dir fs.FS) (any, error) {
+	secrets, err := FromDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -72,9 +108,28 @@ func (s *Store) parser(r io.Reader) (interface{}, error) {
 
 // secretHandler creates the middleware chain.
 func (s *Store) secretHandler(middlewares ...SecretMiddleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, m := range middlewares {
-		s.secretHandlerFunc = m(s.secretHandlerFunc)
+		s.unsafeSecretHandlerFunc = m(s.unsafeSecretHandlerFunc)
 	}
+}
+
+// secretHandlerFunc guards calling s.unsafeSecretHandlerFunc with a mutex.
+func (s *Store) secretHandlerFunc(sec *Secrets) {
+	// grab current secret handler func while holding the lock to guard against
+	// updates to the handler func.
+	currentSecretHandlerFunc := func() SecretHandlerFunc {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return s.unsafeSecretHandlerFunc
+	}()
+
+	// execute the secret handler func outside the lock to not tie it up once
+	// we safely have a handler func.
+	currentSecretHandlerFunc(sec)
 }
 
 func (s *Store) getSecrets() *Secrets {
@@ -106,17 +161,17 @@ func (s *Store) AddMiddlewares(middlewares ...SecretMiddleware) {
 }
 
 // GetSimpleSecret loads secrets from watcher, and fetches a simple secret from secrets
-func (s Store) GetSimpleSecret(path string) (SimpleSecret, error) {
+func (s *Store) GetSimpleSecret(path string) (SimpleSecret, error) {
 	return s.getSecrets().GetSimpleSecret(path)
 }
 
 // GetVersionedSecret loads secrets from watcher, and fetches a versioned secret from secrets
-func (s Store) GetVersionedSecret(path string) (VersionedSecret, error) {
+func (s *Store) GetVersionedSecret(path string) (VersionedSecret, error) {
 	return s.getSecrets().GetVersionedSecret(path)
 }
 
 // GetCredentialSecret loads secrets from watcher, and fetches a credential secret from secrets
-func (s Store) GetCredentialSecret(path string) (CredentialSecret, error) {
+func (s *Store) GetCredentialSecret(path string) (CredentialSecret, error) {
 	return s.getSecrets().GetCredentialSecret(path)
 }
 
@@ -125,6 +180,6 @@ func (s Store) GetCredentialSecret(path string) (CredentialSecret, error) {
 // role. This is only necessary if talking directly to Vault.
 //
 // This function always returns nil error.
-func (s Store) GetVault() (Vault, error) {
+func (s *Store) GetVault() (Vault, error) {
 	return s.getSecrets().vault, nil
 }

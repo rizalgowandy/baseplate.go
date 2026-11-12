@@ -2,8 +2,6 @@ package tracing
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,9 +9,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/gofrs/uuid"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 
+	"github.com/reddit/baseplate.go/detach"
+	//lint:ignore SA1019 This library is internal only, not actually deprecated
+	"github.com/reddit/baseplate.go/internalv2compat"
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/mqsend"
 	"github.com/reddit/baseplate.go/randbp"
@@ -32,8 +32,6 @@ const (
 	MaxQueueSize = 10000
 	// Prefix added to the queue name.
 	QueueNamePrefix = "traces-"
-	// The default MaxRecordTimeout used in Tracers.
-	DefaultMaxRecordTimeout = time.Millisecond * 50
 )
 
 func init() {
@@ -41,6 +39,30 @@ func init() {
 	opentracing.SetGlobalTracer(&globalTracer)
 	// Init the global allow-list
 	SetMetricsTagsAllowList(nil)
+	// Register a ValueWrap with the detach library
+	detach.Register(detach.Hooks{
+		Inline: func(dst, src context.Context) context.Context {
+			return opentracing.ContextWithSpan(dst, opentracing.SpanFromContext(src))
+		},
+		Async: func(dst, src context.Context, next func(ctx context.Context)) {
+			span := opentracing.SpanFromContext(src)
+			if span == nil {
+				next(dst)
+				return
+			}
+
+			child := opentracing.GlobalTracer().StartSpan(
+				"asyncTask",
+				opentracing.ChildOf(AsSpan(span)),
+				SpanTypeOption{Type: SpanTypeLocal},
+			)
+			defer child.FinishWithOptions(FinishOptions{
+				Ctx: dst,
+			}.Convert())
+
+			next(opentracing.ContextWithSpan(dst, child))
+		},
+	})
 }
 
 var globalTracer = Tracer{logger: log.NopWrapper}
@@ -52,82 +74,7 @@ type Tracer struct {
 	logger           log.Wrapper
 	endpoint         ZipkinEndpointInfo
 	maxRecordTimeout time.Duration
-	useUUID          bool
-	uuidRemoveHyphen bool
-}
-
-// TracerConfig are the configuration values to be used in InitGlobalTracer.
-type TracerConfig struct {
-	// The name of the service that will be attached to every span.
-	ServiceName string
-
-	// SampleRate should be in the range of [0, 1].
-	// When SampleRate >= 1, all traces will be recoreded;
-	// When SampleRate <= 0, none of the traces will be recorded,
-	// except the ones with debug flag set.
-	//
-	// Please note that SampleRate only affect top level spans created inside this
-	// service. For most services the sample status will be inherited from the
-	// headers from the client.
-	SampleRate float64
-
-	// Logger, if non-nil, will be used to log additional informations Record
-	// returned certain errors.
-	Logger log.Wrapper
-
-	// The max timeout applied to Record function.
-	//
-	// If the passed in context object has an earlier deadline set,
-	// that deadline will be respected instead.
-	// But if the passed in context is already canceled,
-	// then we ignore it and create a new background context with this timeout.
-	//
-	// If MaxRecordTimeout <= 0, DefaultMaxRecordTimeout will be used.
-	MaxRecordTimeout time.Duration
-
-	// The name of the message queue to be used to actually send sampled spans to
-	// backend service (requires Baseplate.py tracing publishing sidecar with the
-	// same name configured).
-	//
-	// QueueName should not contain "traces-" prefix, it will be auto added.
-	//
-	// If QueueName is empty, no spans will be sampled,
-	// including the ones with debug flag set.
-	QueueName string
-
-	// The max size of the message queue (number of messages).
-	//
-	// If it <=0 or > MaxQueueSize (the constant, 10000),
-	// MaxQueueSize constant will be used instead.
-	//
-	// This is only used when QueueName is non-empty.
-	MaxQueueSize int64
-
-	// If UseUUID is set to true, when generating new trace/span IDs we will use
-	// UUID4 instead of uint64.
-	//
-	// You should only set this to true if you know all of your upstream servers
-	// can handle UUID trace ids (Baseplate.go v0.8.0+ or Baseplate.py v2.0.0+).
-	//
-	// By default (UUIDIntact == false), we remove the hyphens from generated uuid
-	// so they are in lowercase hex format [1],
-	// as some zipkin validators would reject ids with hyphens in them [2].
-	// Set UUIDIntact to true to disable this behavior and keep hyphens in them.
-	//
-	// [1]: example: "cced093a-76ee-a418-ffdc9bb9a6453df3" -> "cced093a76eea418ffdc9bb9a6453df3"
-	// [2]: https://github.com/Findorgri/zipkin/blob/ac83af336faf831b197a8af76d1b35343496d27c/zipkin/src/main/java/zipkin2/internal/HexCodec.java#L58
-	UseUUID    bool
-	UUIDIntact bool
-
-	// In test code,
-	// this field can be used to set the message queue the tracer publishes to,
-	// usually an *mqsend.MockMessageQueue.
-	//
-	// This field will be ignored when QueueName is non-empty,
-	// to help avoiding footgun prod code.
-	//
-	// DO NOT USE IN PROD CODE.
-	TestOnlyMockMessageQueue mqsend.MessageQueue
+	useHex           bool
 }
 
 // InitGlobalTracer initializes opentracing's global tracer.
@@ -136,7 +83,11 @@ type TracerConfig struct {
 // as part of the span information send to the backend service.
 // If it fails to do so, UndefinedIP will be used instead,
 // and the error will be logged if logger is non-nil.
-func InitGlobalTracer(cfg TracerConfig) error {
+func InitGlobalTracer(cfg Config) error {
+	if internalv2compat.V2TracingEnabled() {
+		log.Info(`v2 tracing is enabled; skipping v0 tracer configuration`)
+		return nil
+	}
 	var tracer Tracer
 	if cfg.QueueName != "" {
 		if cfg.MaxQueueSize <= 0 || cfg.MaxQueueSize > MaxQueueSize {
@@ -156,8 +107,7 @@ func InitGlobalTracer(cfg TracerConfig) error {
 	}
 
 	tracer.sampleRate = cfg.SampleRate
-	tracer.useUUID = cfg.UseUUID
-	tracer.uuidRemoveHyphen = !cfg.UUIDIntact
+	tracer.useHex = cfg.UseHex
 
 	logger := cfg.Logger
 	if logger == nil {
@@ -165,18 +115,14 @@ func InitGlobalTracer(cfg TracerConfig) error {
 	}
 	tracer.logger = logger
 
-	timeout := cfg.MaxRecordTimeout
-	if timeout <= 0 {
-		timeout = DefaultMaxRecordTimeout
-	}
-	tracer.maxRecordTimeout = timeout
+	tracer.maxRecordTimeout = cfg.MaxRecordTimeout
 
 	ip, err := runtimebp.GetFirstIPv4()
 	if err != nil {
 		logger(context.Background(), `Unable to get local ip address: `+err.Error())
 	}
 	tracer.endpoint = ZipkinEndpointInfo{
-		ServiceName: cfg.ServiceName,
+		ServiceName: cfg.Namespace,
 		IPv4:        ip,
 	}
 
@@ -196,7 +142,7 @@ func (closer) Close() error {
 //
 // After successful initialization,
 // the returned Closer would delegate to CloseTracer upon called.
-func InitGlobalTracerWithCloser(cfg TracerConfig) (io.Closer, error) {
+func InitGlobalTracerWithCloser(cfg Config) (io.Closer, error) {
 	if err := InitGlobalTracer(cfg); err != nil {
 		return nil, err
 	}
@@ -289,9 +235,9 @@ func (t *Tracer) StartSpan(operationName string, opts ...opentracing.StartSpanOp
 	if parent != nil {
 		parent.initChildSpan(span)
 	} else {
-		span.trace.traceID = t.newID()
+		span.trace.traceID = t.newTraceID()
 		span.trace.sampled = randbp.ShouldSampleWithRate(t.sampleRate)
-		initRootSpan(span)
+		initRootSpan(context.Background(), span)
 	}
 
 	if span.spanType == SpanTypeServer {
@@ -321,26 +267,19 @@ func (t *Tracer) Extract(format interface{}, carrier interface{}) (opentracing.S
 	return nil, opentracing.ErrInvalidCarrier
 }
 
-func (t *Tracer) newID() string {
-	if t.useUUID {
-		id, err := uuid.NewV4()
-		if err != nil {
-			t.logger.Log(
-				context.Background(),
-				fmt.Sprintf("Failed to generate uuid: %v", err),
-			)
-			// On modern linux kernel, after the system entropy pool is initialized
-			// it's guaranteed to be able to get up to 256 bytes in one call without
-			// error [1], so this should never happen.
-			//
-			// But just in case, use fake uuid as a fallback.
-			//
-			// [1]: https://man7.org/linux/man-pages/man2/getrandom.2.html
-			return t.fakeUUID()
-		}
-		return t.uuidToString(id)
+func (t *Tracer) newTraceID() string {
+	if t.useHex {
+		// For traces we just combine two 64-bit hex ids to get a 128-bit hex id.
+		return hexID64() + hexID64()
 	}
-	return strconv.FormatUint(nonZeroRandUint64(), 10)
+	return decID64()
+}
+
+func (t *Tracer) newSpanID() string {
+	if t.useHex {
+		return hexID64()
+	}
+	return decID64()
 }
 
 func findFirstParentReference(refs []opentracing.SpanReference) *Span {
@@ -366,41 +305,12 @@ func CloseTracer() error {
 	return nil
 }
 
-// fakeUUID generates a fake UUID using pseudo random number generator.
-//
-// It does that by getting 16 bytes from PRNG,
-// then feed them into uuid.FromBytes().
-// It's fake as in the following senses:
-//
-// 1. An UUID should be generated from crypto random source, not PRNG.
-//
-// 2. None of the defined UUID version is just using 16 random bytes.
-//
-// We only use this function as a last resort,
-// when we encounter errors getting enough entropy from crypto random source.
-// As this still looks like an UUID so it's "good enough" for trace/span id
-// purposes, and it's better than either panic or empty id.
-func (t *Tracer) fakeUUID() string {
-	const (
-		uuidBytes   = 16
-		uint32Bytes = 4
-	)
-	b := make([]byte, uuidBytes)
-	for i := 0; i < uuidBytes; i += uint32Bytes {
-		// We generate 4 random uint32 instead of using the reader to read 16 bytes
-		// directly, because the reader implementation decided that even if we are
-		// reading 16 bytes out of the random number generator, we only have 8 bytes
-		// of randomness, because we generate a random uint64 to seed the reader.
-		binary.BigEndian.PutUint32(b[i:], randbp.R.Uint32())
-	}
-	// It's safe to use uuid.Must here because the only way uuid.FromBytes could
-	// return error is that the length of b is not 16.
-	return t.uuidToString(uuid.Must(uuid.FromBytes(b)))
+// hexID64 generates 64-bit hex id.
+func hexID64() string {
+	return fmt.Sprintf("%016x", randbp.R.Uint64())
 }
 
-func (t *Tracer) uuidToString(id uuid.UUID) string {
-	if t.uuidRemoveHyphen {
-		return hex.EncodeToString(id.Bytes())
-	}
-	return id.String()
+// decID64 generates 64-bit dec id, excluding 0.
+func decID64() string {
+	return strconv.FormatUint(nonZeroRandUint64(), 10)
 }

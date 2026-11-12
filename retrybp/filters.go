@@ -5,9 +5,8 @@ import (
 	"errors"
 	"net"
 
-	retry "github.com/avast/retry-go"
-
-	"github.com/reddit/baseplate.go/clientpool"
+	"github.com/avast/retry-go"
+	"github.com/sony/gobreaker"
 )
 
 const (
@@ -83,36 +82,6 @@ func NetworkErrorFilter(err error, next retry.RetryIfFunc) bool {
 	return next(err)
 }
 
-// PoolExhaustedFilter returns true if the error is an
-// clientpool.ErrExhausted error otherwise it calls the next filter in the chain.
-//
-// This is safe to use even if a request is not idempotent as this error happens
-// before any network calls are made.  It is best paired with some backoff
-// though to give the pool some time to recover.
-//
-// DEPRECATED: clientpool.ErrExhausted implements RetryableError,
-// so RetryableErrorFilter covers the functionality of this filter and should be
-// used instead.
-func PoolExhaustedFilter(err error, next retry.RetryIfFunc) bool {
-	if errors.Is(err, clientpool.ErrExhausted) {
-		return true
-	}
-	return next(err)
-}
-
-// UnrecoverableErrorFilter returns false if the error is an
-// retry.Unrecoverable error otherwise it calls the next filter in the chain.
-//
-// This uses retry.IsRecoverable which relies on wrapping the error with
-// retry.Unrecoverable.  It also does not use the "errors" helpers so if the
-// the error returned by retry.Unrecoverable is further wrapped, this will not
-// be able to make a decision.
-//
-// DEPRECATED: Please use retrybp.Unrecoverable and RetryableErrorFilter instead.
-func UnrecoverableErrorFilter(err error, next retry.RetryIfFunc) bool {
-	return RetryableErrorFilter(err, next)
-}
-
 // RetryableError defines an optional error interface to return retryable info.
 type RetryableError interface {
 	error
@@ -171,6 +140,26 @@ func RetryableErrorFilter(err error, next retry.RetryIfFunc) bool {
 	return next(err)
 }
 
+// BreakerErrorFilter is a Filter implementations that retries circuit-breaker
+// errors from gobreaker/breakerbp.
+//
+// It should only be used when you are using circuit breaker,
+// and have proper backoff policy set
+// (e.g. using retrybp.CappedExponentialBackoff).
+func BreakerErrorFilter(err error, next retry.RetryIfFunc) bool {
+	// ErrOpenState is returned when the breaker is in open state,
+	// and ErrTooManyRequests is returned when the breaker is half-open and rate
+	// limited.
+	//
+	// They are both retryable as long as we have proper backoff policy set,
+	// as if the state is still open when we retry it will fail fast and also not
+	// adding extra load to the upstream service.
+	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+		return true
+	}
+	return next(err)
+}
+
 type retryableWrapper struct {
 	err       error
 	retryable int
@@ -207,9 +196,8 @@ func Unrecoverable(err error) error {
 var (
 	_ Filter = ContextErrorFilter
 	_ Filter = NetworkErrorFilter
-	_ Filter = PoolExhaustedFilter
-	_ Filter = UnrecoverableErrorFilter
 	_ Filter = RetryableErrorFilter
+	_ Filter = BreakerErrorFilter
 
 	_ RetryableError = retryableWrapper{}
 )

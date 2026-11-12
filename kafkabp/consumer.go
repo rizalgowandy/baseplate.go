@@ -5,10 +5,11 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/reddit/baseplate.go/metricsbp"
 	"github.com/reddit/baseplate.go/tracing"
 )
 
@@ -28,28 +29,57 @@ type ConsumeMessageFunc func(ctx context.Context, msg *sarama.ConsumerMessage)
 // In most cases the implementation just needs to log the error and emit a
 // counter, for example:
 //
-//     consumer.Consume(
-//       consumeMessageFunc,
-//       func(err error) {
-//         log.ErrorWithSentry(
-//           context.Background(),
-//           "kafka consumer error",
-//           err,
-//           // additional key value pairs, for example topic info
-//         )
-//         metricsbp.M.Counter("kafka.consumer.errors").With(/* key value pairs */).Add(1)
-//       },
-//     )
+//	consumer.Consume(
+//	  consumeMessageFunc,
+//	  func(err error) {
+//	    log.Errorw(
+//	      context.Background(),
+//	      "kafka consumer error",
+//	      "err", err,
+//	      // additional key value pairs, for example topic info
+//	    )
+//	    // a prometheus counter
+//	    consumerErrorCounter.Inc()
+//	  },
+//	)
 type ConsumeErrorFunc func(err error)
 
+// ConsumePartitionFunc is a function type for application to specify which
+// partitions of the topic to consume data from.
+type ConsumePartitionFunc func(partitionID int32) bool
+
+// ConsumePartitionFuncProvider is a function type for application to
+// provide a lambda function of ConsumePartitionFunc pinned for specific
+// number of partitions. This allows creation of ConsumePartitionFunc once per
+// reset. All PartitionConsumers when created decide if a partition is to be
+// skipped or selected for consumption based on decision handed out by same
+// instance implementation of ConsumePartitionFunc.
+type ConsumePartitionFuncProvider func(numPartitions int) ConsumePartitionFunc
+
+// ConsumeAllPartitionsFunc is a ConsumePartitionFunc that is to be used to
+// specify all partitions to be consumed by the topic consumer.
+//
+// This function always returns true, causing all partitions to be consumed.
+func ConsumeAllPartitionsFunc(partitionID int32) bool {
+	return true
+}
+
+// ConsumeAllPartitionsFuncProvider is a ConsumePartitionFuncProvider that
+// always selects all partitions.
+func ConsumeAllPartitionsFuncProvider(numPartitions int) ConsumePartitionFunc {
+	return ConsumeAllPartitionsFunc
+}
+
 // Consumer defines the interface of a consumer struct.
+//
+// It's also a superset of (implements) baseplate.HealthChecker.
 type Consumer interface {
 	io.Closer
 
 	Consume(ConsumeMessageFunc, ConsumeErrorFunc) error
 
 	// IsHealthy returns false after Consume returns.
-	IsHealthy() bool
+	IsHealthy(ctx context.Context) bool
 }
 
 // consumer implements a Kafka consumer.
@@ -57,13 +87,15 @@ type consumer struct {
 	cfg ConsumerConfig
 	sc  *sarama.Config
 
-	consumer           atomic.Value // sarama.Consumer
-	partitions         atomic.Value // []int32
-	partitionConsumers atomic.Value // []sarama.PartitionConsumer
+	consumer                  atomic.Pointer[sarama.Consumer]
+	partitions                atomic.Pointer[[]int32]
+	partitionConsumers        atomic.Pointer[[]sarama.PartitionConsumer]
+	partitionSelectorProvider ConsumePartitionFuncProvider
 
-	closed          int64
-	consumeReturned int64
-	offset          int64
+	closed          atomic.Int64
+	consumeReturned atomic.Int64
+
+	offset int64
 
 	wg sync.WaitGroup
 }
@@ -82,9 +114,23 @@ type consumer struct {
 // topic. This implementation of Kafka consumer is suitable for use cases like
 // deliver config/data through Kafka to services.
 func NewConsumer(cfg ConsumerConfig) (Consumer, error) {
+	return NewConsumerWithConfigOverriders(cfg)
+}
+
+// SaramaConfigOverrider provides a way for users to override certain fields in
+// *sarama.Config generated from ConsumerConfig.
+type SaramaConfigOverrider func(*sarama.Config)
+
+// NewConsumerWithConfigOverriders is provided as an escape hatch for use cases
+// requiring specific sarama config not supported by ConsumerConfig.
+func NewConsumerWithConfigOverriders(cfg ConsumerConfig, overriders ...SaramaConfigOverrider) (Consumer, error) {
 	sc, err := cfg.NewSaramaConfig()
 	if err != nil {
 		return nil, err
+	}
+
+	for _, override := range overriders {
+		override(sc)
 	}
 
 	switch {
@@ -96,10 +142,15 @@ func NewConsumer(cfg ConsumerConfig) (Consumer, error) {
 }
 
 func newTopicConsumer(cfg ConsumerConfig, sc *sarama.Config) (Consumer, error) {
+	if cfg.ConsumePartitionFuncProvider == nil {
+		cfg.ConsumePartitionFuncProvider = ConsumeAllPartitionsFuncProvider
+	}
+
 	kc := &consumer{
-		cfg:    cfg,
-		sc:     sc,
-		offset: sc.Consumer.Offsets.Initial,
+		cfg:                       cfg,
+		sc:                        sc,
+		offset:                    sc.Consumer.Offsets.Initial,
+		partitionSelectorProvider: cfg.ConsumePartitionFuncProvider,
 	}
 
 	// Initialize Sarama consumer and set atomic values.
@@ -111,18 +162,24 @@ func newTopicConsumer(cfg ConsumerConfig, sc *sarama.Config) (Consumer, error) {
 }
 
 func (kc *consumer) getConsumer() sarama.Consumer {
-	c, _ := kc.consumer.Load().(sarama.Consumer)
-	return c
+	if loaded := kc.consumer.Load(); loaded != nil {
+		return *loaded
+	}
+	return nil
 }
 
 func (kc *consumer) getPartitions() []int32 {
-	p, _ := kc.partitions.Load().([]int32)
-	return p
+	if loaded := kc.partitions.Load(); loaded != nil {
+		return *loaded
+	}
+	return nil
 }
 
 func (kc *consumer) getPartitionConsumers() []sarama.PartitionConsumer {
-	pc, _ := kc.partitionConsumers.Load().([]sarama.PartitionConsumer)
-	return pc
+	if loaded := kc.partitionConsumers.Load(); loaded != nil {
+		return *loaded
+	}
+	return nil
 }
 
 // reset recreates the consumer and assigns partitions.
@@ -136,7 +193,14 @@ func (kc *consumer) reset() error {
 		}
 	}
 
-	rebalance := func() error {
+	rebalance := func() (err error) {
+		defer func() {
+			rebalanceTotalCounter.Inc()
+			if err != nil {
+				rebalanceFailureCounter.Inc()
+			}
+		}()
+
 		c, err := sarama.NewConsumer(kc.cfg.Brokers, kc.sc)
 		if err != nil {
 			return err
@@ -148,36 +212,33 @@ func (kc *consumer) reset() error {
 			return err
 		}
 
-		kc.consumer.Store(c)
-		kc.partitions.Store(partitions)
+		kc.consumer.Store(&c)
+		kc.partitions.Store(&partitions)
 		return nil
 	}
 
-	err := rebalance()
-	if err != nil {
-		metricsbp.M.Counter("kafka.consumer.rebalance.failure").Add(1)
-		return err
-	}
-
-	metricsbp.M.Counter("kafka.consumer.rebalance.success").Add(1)
-	return nil
+	return rebalance()
 }
 
 // Close closes all partition consumers first, then the parent consumer.
 func (kc *consumer) Close() error {
 	// Return early if closing is already in progress
-	if !atomic.CompareAndSwapInt64(&kc.closed, 0, 1) {
+	if !kc.closed.CompareAndSwap(0, 1) {
 		return nil
 	}
 
-	partitionConsumers := kc.getPartitionConsumers()
-	for _, pc := range partitionConsumers {
-		// leaves room to drain pc's message and error channels
-		pc.AsyncClose()
+	if partitionConsumers := kc.getPartitionConsumers(); partitionConsumers != nil {
+		for _, pc := range partitionConsumers {
+			// leaves room to drain pc's message and error channels
+			pc.AsyncClose()
+		}
 	}
 	// wait for the Consume function to return
 	kc.wg.Wait()
-	return kc.getConsumer().Close()
+	if c := kc.getConsumer(); c != nil {
+		return c.Close()
+	}
+	return nil
 }
 
 // Consume consumes Kafka messages and errors from each partition's consumer.
@@ -187,7 +248,7 @@ func (kc *consumer) Consume(
 	messagesFunc ConsumeMessageFunc,
 	errorsFunc ConsumeErrorFunc,
 ) error {
-	defer atomic.StoreInt64(&kc.consumeReturned, 1)
+	defer kc.consumeReturned.Store(1)
 	kc.wg.Add(1)
 	defer kc.wg.Done()
 
@@ -200,9 +261,22 @@ func (kc *consumer) Consume(
 		// create a partition consumer for each partition
 		consumer := kc.getConsumer()
 		partitions := kc.getPartitions()
-		partitionConsumers := make([]sarama.PartitionConsumer, 0, len(partitions))
+		numPartitions := len(partitions)
+		partitionsSelector := kc.partitionSelectorProvider(numPartitions)
+		if partitionsSelector == nil {
+			return ErrNilConsumePartitionFunc
+		}
+		partitionConsumers := make([]sarama.PartitionConsumer, 0, numPartitions)
+		partitionsToConsume := make([]bool, numPartitions)
+		for _, partition := range partitions {
+			partitionsToConsume[partition] = partitionsSelector(partition)
+		}
 
 		for _, p := range partitions {
+			if !partitionsToConsume[p] {
+				// partition p is to be skipped.
+				continue
+			}
 			partitionConsumer, err := consumer.ConsumePartition(kc.cfg.Topic, p, kc.offset)
 			if err != nil {
 				return err
@@ -220,11 +294,14 @@ func (kc *consumer) Consume(
 						var span *tracing.Span
 						spanName := "consumer." + kc.cfg.Topic
 						ctx, span = tracing.StartTopLevelServerSpan(ctx, spanName)
-						defer func() {
+						defer func(start time.Time) {
+							consumerTimer.With(prometheus.Labels{
+								topicLabel: kc.cfg.Topic,
+							}).Observe(time.Since(start).Seconds())
 							span.FinishWithOptions(tracing.FinishOptions{
 								Ctx: ctx,
 							}.Convert())
-						}()
+						}(time.Now())
 
 						messagesFunc(ctx, m)
 					}()
@@ -240,13 +317,13 @@ func (kc *consumer) Consume(
 				}
 			}(partitionConsumer)
 		}
-		kc.partitionConsumers.Store(partitionConsumers)
+		kc.partitionConsumers.Store(&partitionConsumers)
 
 		wg.Wait()
 
 		// Close or AsyncClose was called, so exit. The call to Close handles
 		// cleaning up the consumer.
-		if atomic.LoadInt64(&kc.closed) != 0 {
+		if kc.closed.Load() != 0 {
 			return nil
 		}
 
@@ -260,6 +337,6 @@ func (kc *consumer) Consume(
 }
 
 // IsHealthy returns true until Consume returns, then false thereafter.
-func (kc *consumer) IsHealthy() bool {
-	return atomic.LoadInt64(&kc.consumeReturned) == 0
+func (kc *consumer) IsHealthy(_ context.Context) bool {
+	return kc.consumeReturned.Load() == 0
 }

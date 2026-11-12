@@ -1,13 +1,19 @@
 package thriftbp
 
 import (
+	"context"
+	"fmt"
+	"path"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	baseplate "github.com/reddit/baseplate.go"
+	"github.com/reddit/baseplate.go"
 	"github.com/reddit/baseplate.go/errorsbp"
-	"github.com/reddit/baseplate.go/log"
+	//lint:ignore SA1019 This library is internal only, not actually deprecated
+	"github.com/reddit/baseplate.go/internalv2compat"
 )
 
 // ServerConfig is the arg struct for both NewServer and NewBaseplateServer.
@@ -31,7 +37,17 @@ type ServerConfig struct {
 	// Optional, used only by NewServer.
 	//
 	// A log wrapper that is used by the TSimpleServer.
+	//
+	// Deprecated: Use LogContext instead.
+	//
+	//lint:ignore SA1019 We need to keep this field available despite that its
+	//type is deprecated.
 	Logger thrift.Logger
+
+	// Optional, used only by NewServer.
+	//
+	// The context used for slog logging for processor errors for TSimpleServer.
+	LogContext context.Context
 
 	// Optional, used only by NewBaseplateServer.
 	//
@@ -44,7 +60,18 @@ type ServerConfig struct {
 	//
 	// Report the payload size metrics with this sample rate.
 	// If not set none of the requests will be sampled.
+	//
+	// Deprecated: Server side payload size reporting is always 100% enabled when
+	// using NewBaseplateServer.
 	ReportPayloadSizeMetricsSampleRate float64
+
+	// Optional, used by NewBaseplateServer and NewServer.
+	//
+	// Report the number of clients connected to the server as a runtime gauge
+	// with metric name of 'thrift.connections'
+	//
+	// Deprecated: This feature is removed.
+	ReportConnectionCount bool
 
 	// Optional, used only by NewServer.
 	// In NewBaseplateServer the address set in bp.Config() will be used instead.
@@ -54,23 +81,24 @@ type ServerConfig struct {
 	// This is ignored if Socket is non-nil.
 	Addr string
 
-	// Optional, used only by NewServer.
-	// In NewBaseplateServer the timeout set in bp.Config() will be used instead.
-	//
-	// The timeout for the underlying thrift.TServerSocket transport.
-	//
-	// If your clients use client pool,
-	// it's recommended to either not set a Timeout on your server,
-	// or set it to a long value that's longer than your clients' pool TTL.
-	//
-	// This is ignored if Socket is non-nil.
+	// Deprecated: No-op for now, will be removed in a future release.
 	Timeout time.Duration
+
+	// Optional, This duration is used to set both the read and write idle timeouts
+	// for the thrift.TServerSocket used by the baseplate server.
+	//
+	// This is an experimental configuration and is subject to change or deprecation
+	// without notice. When using NewBaseplateServer, setting a socket timeout will
+	// also override the default thrift server logger to one that emits metrics
+	// instead of logs in the event of a socket disconnect. A zero value means I/O
+	// read or write operations will not time out.
+	SocketTimeout time.Duration
 
 	// Optional, used only by NewServer.
 	// In NewBaseplateServer the address and timeout set in bp.Config() will be
 	// used instead.
 	//
-	// You can choose to set Socket instead of Addr plus Timeout.
+	// You can choose to set Socket instead of Addr.
 	Socket *thrift.TServerSocket
 }
 
@@ -78,10 +106,14 @@ type ServerConfig struct {
 // and protocol to serve the given TProcessor which is wrapped with the
 // given ProcessorMiddlewares.
 func NewServer(cfg ServerConfig) (*thrift.TSimpleServer, error) {
-	var transport *thrift.TServerSocket
+	var transport thrift.TServerTransport
 	if cfg.Socket == nil {
 		var err error
-		transport, err = thrift.NewTServerSocketTimeout(cfg.Addr, cfg.Timeout)
+		if cfg.SocketTimeout > 0 {
+			transport, err = thrift.NewTServerSocketTimeout(cfg.Addr, cfg.SocketTimeout)
+		} else {
+			transport, err = thrift.NewTServerSocket(cfg.Addr)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -89,14 +121,20 @@ func NewServer(cfg ServerConfig) (*thrift.TSimpleServer, error) {
 		transport = cfg.Socket
 	}
 
+	middlewares := make([]thrift.ProcessorMiddleware, 0, len(cfg.Middlewares)+1)
+	middlewares = append(middlewares, cfg.Middlewares...)
+	middlewares = append(middlewares, recoverPanik)
+
 	server := thrift.NewTSimpleServer4(
-		thrift.WrapProcessor(cfg.Processor, cfg.Middlewares...),
+		thrift.WrapProcessor(cfg.Processor, middlewares...),
 		transport,
-		thrift.NewTHeaderTransportFactory(nil),
-		thrift.NewTHeaderProtocolFactory(),
+		thrift.NewTHeaderTransportFactoryConf(nil, nil),
+		thrift.NewTHeaderProtocolFactoryConf(nil),
 	)
 	server.SetForwardHeaders(HeadersToForward)
-	server.SetLogger(cfg.Logger)
+	if cfg.LogContext != nil {
+		server.SetLogContext(cfg.LogContext)
+	}
 	return server, nil
 }
 
@@ -108,16 +146,15 @@ func NewBaseplateServer(
 ) (baseplate.Server, error) {
 	middlewares := BaseplateDefaultProcessorMiddlewares(
 		DefaultProcessorMiddlewaresArgs{
-			EdgeContextImpl:                    bp.EdgeContextImpl(),
-			ErrorSpanSuppressor:                cfg.ErrorSpanSuppressor,
-			ReportPayloadSizeMetricsSampleRate: cfg.ReportPayloadSizeMetricsSampleRate,
+			EdgeContextImpl:     bp.EdgeContextImpl(),
+			ServiceName:         GetThriftServiceName(cfg.Processor),
+			ErrorSpanSuppressor: cfg.ErrorSpanSuppressor,
 		},
 	)
 	middlewares = append(middlewares, cfg.Middlewares...)
 	cfg.Middlewares = middlewares
-	cfg.Logger = log.ZapWrapper(bp.Config().Log.Level).ToThriftLogger()
-	cfg.Addr = bp.Config().Addr
-	cfg.Timeout = bp.Config().Timeout
+
+	cfg.Addr = bp.GetConfig().Addr
 	cfg.Socket = nil
 	srv, err := NewServer(cfg)
 	if err != nil {
@@ -138,6 +175,8 @@ func ApplyBaseplate(bp baseplate.Baseplate, server *thrift.TSimpleServer) basepl
 type impl struct {
 	bp  baseplate.Baseplate
 	srv *thrift.TSimpleServer
+
+	internalv2compat.IsThrift
 }
 
 func (s impl) Baseplate() baseplate.Baseplate {
@@ -156,3 +195,19 @@ var (
 	_ baseplate.Server = impl{}
 	_ baseplate.Server = (*impl)(nil)
 )
+
+func GetThriftServiceName(processor thrift.TProcessor) string {
+	t := reflect.TypeOf(processor)
+	if t == nil {
+		return "unknown"
+	}
+	value := t.Elem()
+	if value == nil {
+		return "unknown"
+	}
+
+	return fmt.Sprintf("%s.%s",
+		path.Base(value.PkgPath()),
+		strings.TrimSuffix(value.Name(), "Processor"),
+	)
+}

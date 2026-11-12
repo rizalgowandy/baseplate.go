@@ -233,6 +233,11 @@ func (m MockClientPool) IsExhausted() bool {
 	return m.Exhausted
 }
 
+// TClient implements thriftbp.ClientPool.
+func (m MockClientPool) TClient() thrift.TClient {
+	return m
+}
+
 // Call implements TClient.
 //
 // If Exhausted is set to true,
@@ -270,22 +275,22 @@ func (m MockClientPool) getClient() (thriftbp.Client, error) {
 //
 // Example:
 //
-//     myMockClient.AddMockCall(
-//       "myEndpoint",
-//       func(ctx context.Context, args, result thrift.TStruct) error {
-//         return thrifttest.CopyTStruct(
-//           ctx,
-//           result,
-//           &myservice.MyServiceMyEndpointResult{
-//             Success: &myservice.MyEndpointResponse{
-//               // Set the response fields.
-//             },
-//           },
-//         )
-//       },
-//     )
+//	myMockClient.AddMockCall(
+//	  "myEndpoint",
+//	  func(ctx context.Context, args, result thrift.TStruct) error {
+//	    return thrifttest.CopyTStruct(
+//	      ctx,
+//	      result,
+//	      &myservice.MyServiceMyEndpointResult{
+//	        Success: &myservice.MyEndpointResponse{
+//	          // Set the response fields.
+//	        },
+//	      },
+//	    )
+//	  },
+//	)
 func CopyTStruct(ctx context.Context, dst, src thrift.TStruct) error {
-	proto := thrift.NewTBinaryProtocolTransport(thrift.NewTMemoryBuffer())
+	proto := thrift.NewTBinaryProtocolConf(thrift.NewTMemoryBuffer(), nil)
 	if err := src.Write(ctx, proto); err != nil {
 		return err
 	}

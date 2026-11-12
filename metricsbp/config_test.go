@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 
 	"github.com/reddit/baseplate.go/metricsbp"
 )
@@ -37,13 +37,11 @@ endpoint: bar:8080
 			body: `
 namespace: foo
 endpoint: bar:8080
-counterSampleRate: 0.1
 histogramSampleRate: 0.01
 `,
 			expected: metricsbp.Config{
 				Namespace:           "foo",
 				Endpoint:            "bar:8080",
-				CounterSampleRate:   float64Ptr(0.1),
 				HistogramSampleRate: float64Ptr(0.01),
 			},
 		},

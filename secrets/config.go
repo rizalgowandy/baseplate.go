@@ -4,15 +4,30 @@ import (
 	"context"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/reddit/baseplate.go/internal/prometheusbpint"
 	"github.com/reddit/baseplate.go/log"
+)
+
+var (
+	parserFailures = promauto.With(prometheusbpint.GlobalRegistry).NewCounter(prometheus.CounterOpts{
+		Name: "secrets_parser_failure_total",
+		Help: "Total number of secret parser failures",
+	})
 )
 
 // Config is the confuration struct for the secrets package.
 //
 // Can be deserialized from YAML.
 type Config struct {
-	// Path is the path to the secrets.json file file to load your service's
-	// secrets from.
+	// Path is the path to the secrets.json file or Vault CSI directory to load
+	// your service's secrets from.
+	//
+	// Examples:
+	// - /var/local/secrets/secrets.json
+	// - /mnt/secrets
 	Path string `yaml:"path"`
 }
 
@@ -21,7 +36,10 @@ func InitFromConfig(ctx context.Context, cfg Config) (*Store, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 
-	store, err := NewStore(ctx, cfg.Path, log.ErrorWithSentryWrapper())
+	store, err := NewStore(ctx, cfg.Path, log.CounterWrapper(
+		nil, // delegate, let it fallback to DefaultWrapper
+		parserFailures,
+	))
 	if err != nil {
 		return nil, err
 	}

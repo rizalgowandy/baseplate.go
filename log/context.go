@@ -2,48 +2,83 @@ package log
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/getsentry/sentry-go"
 	"go.uber.org/zap"
+
+	"github.com/reddit/baseplate.go/detach"
+	//lint:ignore SA1019 This library is internal only, not actually deprecated
+	"github.com/reddit/baseplate.go/internalv2compat"
 )
 
 type contextKeyType struct{}
 
 var contextKey contextKeyType
 
+func init() {
+	copyContext := func(dst, src context.Context) context.Context {
+		if logger, ok := src.Value(contextKey).(*zap.SugaredLogger); ok && logger != nil {
+			dst = context.WithValue(dst, contextKey, logger)
+		}
+		return dst
+	}
+	detach.Register(detach.Hooks{
+		Inline: copyContext,
+		Async: func(dst, src context.Context, next func(ctx context.Context)) {
+			next(copyContext(dst, src))
+		},
+	})
+}
+
 // logger keys for attached data.
 const (
 	traceIDKey = "traceID"
 )
 
-// AttachArgs are used to create loggers to be attached to context object with
-// pre-filled key-value pairs.
+// AttachArgs are used to create loggers and sentry hubs to be attached to
+// context object with pre-filled key-value pairs.
 //
 // All zero value fields will be ignored and only non-zero values will be
 // attached.
 //
 // AdditionalPairs are provided to add any free form, additional key-value pairs
-// you want to attach to all logs from the same context object.
+// you want to attach to all logs and sentry reports from the same context
+// object.
 type AttachArgs struct {
 	TraceID string
 
 	AdditionalPairs map[string]interface{}
 }
 
-// Attach attaches a logger with data extracted from args into the context
-// object.
+// Attach attaches a logger and sentry hub with data extracted from args into
+// the context object.
 func Attach(ctx context.Context, args AttachArgs) context.Context {
-	// Number of non-AdditionalPairs fields in AttachArgs struct.
-	const additional = 1
-	kv := make([]interface{}, 0, len(args.AdditionalPairs)*2+additional)
+	// create and attach the sentry hub
+	hub := sentry.GetHubFromContext(ctx)
+	if hub == nil {
+		hub = sentry.CurrentHub()
+	}
+	hub = hub.Clone()
+	hub.ConfigureScope(func(scope *sentry.Scope) {
+		if args.TraceID != "" {
+			scope.SetTag("trace_id", args.TraceID)
+		}
+		for k, v := range args.AdditionalPairs {
+			scope.SetTag(k, fmt.Sprintf("%v", v))
+		}
+	})
+	ctx = context.WithValue(ctx, sentry.HubContextKey, hub)
 
+	// create and attach the logger
+	const additional = 1 // Number of non-AdditionalPairs fields in AttachArgs struct.
+	kv := make([]interface{}, 0, len(args.AdditionalPairs)*2+additional)
 	if args.TraceID != "" {
 		kv = append(kv, zap.String(traceIDKey, args.TraceID))
 	}
-
 	for k, v := range args.AdditionalPairs {
 		kv = append(kv, k, v)
 	}
-
 	logger := C(ctx)
 	if len(kv) == 0 {
 		// We can also just return ctx directly here without attaching,
@@ -64,12 +99,12 @@ func Attach(ctx context.Context, args AttachArgs) context.Context {
 // you should always use this one instead of the global one.
 // For example:
 //
-//     log.C(ctx).Errorw("Something went wrong!", "err", err)
+//	log.C(ctx).Errorw("Something went wrong!", "err", err)
 //
 // The return value is guaranteed to be non-nil.
 func C(ctx context.Context) *zap.SugaredLogger {
 	if logger, ok := ctx.Value(contextKey).(*zap.SugaredLogger); ok && logger != nil {
 		return logger
 	}
-	return globalLogger
+	return internalv2compat.GlobalLogger()
 }

@@ -1,23 +1,47 @@
 #!/bin/sh
 
-DIR=$(dirname $0)/..
-cd $DIR
+DIR=$(dirname "$0")/..
+cd "$DIR" || exit 1
 
-FILES=`find . -name "*.go" | grep -v -e "\/gen-go\/"`
+FILES=$(find . -name "*.go" | grep -v -e "\/gen-go\/")
 FAILED=0
 
 for FILE in $FILES; do
-  LINT=`golint $FILE`
-  if [ -n "$LINT" ]; then
-    echo "$FILE:\ngolint\n$LINT"
-    FAILED=1
-  fi
-
-  FMT=`gofmt -s -d $FILE`
-  if [ -n "$FMT" ]; then
-    echo "$FILE:\ngofmt\n$FMT"
+  FMT=$(gofmt -s -d "$FILE" 2>&1)
+  if [ $? -ne 0 ]; then
+    echo "gofmt:"
+    echo "$FILE:"
+    echo "$FMT"
     FAILED=1
   fi
 done
+
+VET=$(go vet ./... 2>&1)
+if [ $? -ne 0 ]; then
+  echo "go vet:"
+  echo "$VET"
+  FAILED=1
+fi
+
+STATICCHECK=$(staticcheck ./... 2>&1)
+if [ $? -ne 0 ]; then
+  echo "$(staticcheck --version):"
+  echo "$STATICCHECK"
+  FAILED=1
+fi
+
+promauto_new=$(git grep "\<promauto.New" | grep -v "linters.sh" | grep -v "//.*promauto.New")
+if [ -n "$promauto_new" ]; then
+  echo "*** Uses of promauto should use With(prometheusbpint.GlobalRegistry):"
+  echo "$promauto_new"
+  FAILED=1
+fi
+
+prometheus_register=$(git grep -w "prometheus.Register" | grep -v "linters.sh" | grep -v "//.*prometheus.Register")
+if [ -n "$prometheus_register" ]; then
+  echo "*** Uses of prometheus.Register should use prometheusbpint.GlobalRegistry.Register instead:"
+  echo "$prometheus_register"
+  FAILED=1
+fi
 
 exit $FAILED

@@ -2,7 +2,6 @@ package thriftbp_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -10,14 +9,10 @@ import (
 	"github.com/apache/thrift/lib/go/thrift"
 
 	"github.com/reddit/baseplate.go/ecinterface"
-	"github.com/reddit/baseplate.go/mqsend"
 	"github.com/reddit/baseplate.go/thriftbp"
 	"github.com/reddit/baseplate.go/thriftbp/thrifttest"
 	"github.com/reddit/baseplate.go/tracing"
-)
-
-const (
-	testTimeout = time.Millisecond * 100
+	"github.com/reddit/baseplate.go/transport"
 )
 
 type edgecontextRecorder struct {
@@ -35,64 +30,6 @@ func edgecontextRecorderMiddleware(impl ecinterface.Interface, recorder *edgecon
 	}
 }
 
-func TestInjectServerSpan(t *testing.T) {
-	defer func() {
-		tracing.CloseTracer()
-		tracing.InitGlobalTracer(tracing.TracerConfig{})
-	}()
-	mmq := mqsend.OpenMockMessageQueue(mqsend.MessageQueueConfig{
-		MaxQueueSize:   100,
-		MaxMessageSize: 1024,
-	})
-	logger, startFailing := tracing.TestWrapper(t)
-	tracing.InitGlobalTracer(tracing.TracerConfig{
-		SampleRate:               1,
-		MaxRecordTimeout:         testTimeout,
-		Logger:                   logger,
-		TestOnlyMockMessageQueue: mmq,
-	})
-	startFailing()
-	name := "test"
-	processor := thrifttest.NewMockTProcessor(
-		t,
-		map[string]thrift.TProcessorFunction{
-			name: thrift.WrappedTProcessorFunction{
-				Wrapped: func(ctx context.Context, seqID int32, in, out thrift.TProtocol) (bool, thrift.TException) {
-					return false, thrift.WrapTException(errors.New("TError"))
-				},
-			},
-		},
-	)
-	ctx := context.Background()
-	ctx = thrift.SetHeader(ctx, thriftbp.HeaderTracingSampled, thriftbp.HeaderTracingSampledTrue)
-	ctx = thrifttest.SetMockTProcessorName(ctx, name)
-
-	wrapped := thrift.WrapProcessor(processor, thriftbp.InjectServerSpan(nil))
-	wrapped.Process(ctx, nil, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-	msg, err := mmq.Receive(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("Encoded span: %s", msg)
-
-	var trace tracing.ZipkinSpan
-	err = json.Unmarshal(msg, &trace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hasError := false
-	for _, annotation := range trace.BinaryAnnotations {
-		if annotation.Key == "error" {
-			hasError = true
-		}
-	}
-	if !hasError {
-		t.Error("Error binary annotation was not present.")
-	}
-}
-
 func TestStartSpanFromThriftContext(t *testing.T) {
 	const (
 		name   = "foo"
@@ -102,19 +39,19 @@ func TestStartSpanFromThriftContext(t *testing.T) {
 
 	defer func() {
 		tracing.CloseTracer()
-		tracing.InitGlobalTracer(tracing.TracerConfig{})
+		tracing.InitGlobalTracer(tracing.Config{})
 	}()
 	logger, startFailing := tracing.TestWrapper(t)
-	tracing.InitGlobalTracer(tracing.TracerConfig{
+	tracing.InitGlobalTracer(tracing.Config{
 		Logger: logger,
 	})
 	startFailing()
 
 	ctx := context.Background()
-	ctx = thrift.SetHeader(ctx, thriftbp.HeaderTracingTrace, trace)
-	ctx = thrift.SetHeader(ctx, thriftbp.HeaderTracingSpan, spanID)
+	ctx = thrift.SetHeader(ctx, transport.HeaderTracingTrace, trace)
+	ctx = thrift.SetHeader(ctx, transport.HeaderTracingSpan, spanID)
 
-	ctx, span := thriftbp.StartSpanFromThriftContext(ctx, name)
+	_, span := thriftbp.StartSpanFromThriftContext(ctx, name)
 
 	if span.TraceID() != trace {
 		t.Errorf(
@@ -140,7 +77,7 @@ func TestInitializeEdgeContext(t *testing.T) {
 
 	ctx := thrift.SetHeader(
 		context.Background(),
-		thriftbp.HeaderEdgeRequest,
+		transport.HeaderEdgeRequest,
 		expectedHeader,
 	)
 
@@ -173,7 +110,7 @@ func TestInjectEdgeContext(t *testing.T) {
 
 	ctx := thrift.SetHeader(
 		context.Background(),
-		thriftbp.HeaderEdgeRequest,
+		transport.HeaderEdgeRequest,
 		expectedHeader,
 	)
 	ctx = thrifttest.SetMockTProcessorName(ctx, name)
@@ -210,7 +147,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 		func(t *testing.T) {
 			ctx := thrift.SetHeader(
 				context.Background(),
-				thriftbp.HeaderDeadlineBudget,
+				transport.HeaderDeadlineBudget,
 				"foobar",
 			)
 			ctx = thrifttest.SetMockTProcessorName(ctx, name)
@@ -218,7 +155,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 				processor(func(ctx context.Context) {
 					deadline, ok := ctx.Deadline()
 					if ok {
-						t.Errorf("Expected no deadline set, got %v", deadline.Sub(time.Now()))
+						t.Errorf("Expected no deadline set, got %v", time.Until(deadline))
 					}
 				}),
 				thriftbp.ExtractDeadlineBudget,
@@ -232,7 +169,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 		func(t *testing.T) {
 			ctx := thrift.SetHeader(
 				context.Background(),
-				thriftbp.HeaderDeadlineBudget,
+				transport.HeaderDeadlineBudget,
 				"0",
 			)
 			ctx = thrifttest.SetMockTProcessorName(ctx, name)
@@ -240,7 +177,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 				processor(func(ctx context.Context) {
 					deadline, ok := ctx.Deadline()
 					if ok {
-						t.Errorf("Expected no deadline set, got %v", deadline.Sub(time.Now()))
+						t.Errorf("Expected no deadline set, got %v", time.Until(deadline))
 					}
 				}),
 				thriftbp.ExtractDeadlineBudget,
@@ -254,7 +191,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 		func(t *testing.T) {
 			ctx := thrift.SetHeader(
 				context.Background(),
-				thriftbp.HeaderDeadlineBudget,
+				transport.HeaderDeadlineBudget,
 				"50",
 			)
 			ctx = thrifttest.SetMockTProcessorName(ctx, name)
@@ -265,7 +202,7 @@ func TestExtractDeadlineBudget(t *testing.T) {
 						t.Fatal("Deadline not set")
 					}
 
-					duration := deadline.Sub(time.Now())
+					duration := time.Until(deadline)
 					if duration.Round(time.Millisecond).Milliseconds() != 50 {
 						t.Errorf("Expected deadline to be 50ms, got %v", duration)
 					}
@@ -275,4 +212,39 @@ func TestExtractDeadlineBudget(t *testing.T) {
 			wrapped.Process(ctx, nil, nil)
 		},
 	)
+}
+
+func TestPanicMiddleware(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		panicErr := errors.New("oops")
+		next := thrift.WrappedTProcessorFunction{
+			Wrapped: func(ctx context.Context, seqId int32, in, out thrift.TProtocol) (bool, thrift.TException) {
+				panic(panicErr)
+			},
+		}
+		wrapped := thriftbp.RecoverPanic("test", next)
+		ok, err := wrapped.Process(context.Background(), 1, nil, nil)
+		if ok {
+			t.Errorf("expected ok to be false, got true")
+		}
+		if !errors.Is(err, panicErr) {
+			t.Errorf("error mismatch, expectd %v, got %v", panicErr, err)
+		}
+	})
+
+	t.Run("non-error", func(t *testing.T) {
+		next := thrift.WrappedTProcessorFunction{
+			Wrapped: func(ctx context.Context, seqId int32, in, out thrift.TProtocol) (bool, thrift.TException) {
+				panic("oops")
+			},
+		}
+		wrapped := thriftbp.RecoverPanic("test", next)
+		ok, err := wrapped.Process(context.Background(), 1, nil, nil)
+		if ok {
+			t.Errorf("expected ok to be false, got true")
+		}
+		if err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
 }

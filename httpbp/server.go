@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"sync"
 
-	baseplate "github.com/reddit/baseplate.go"
-	"github.com/reddit/baseplate.go/errorsbp"
+	"github.com/reddit/baseplate.go"
+
+	//lint:ignore SA1019 This library is internal only, not actually deprecated
+	"github.com/reddit/baseplate.go/internalv2compat"
 	"github.com/reddit/baseplate.go/log"
 )
 
@@ -45,10 +47,15 @@ type httpHandlerFactory struct {
 }
 
 func (f httpHandlerFactory) NewHandler(endpoint Endpoint) http.Handler {
-	wrappers := make([]Middleware, 0, len(f.middlewares)+len(endpoint.Middlewares)+1)
-	wrappers = append(wrappers, SupportedMethods(endpoint.Methods[0], endpoint.Methods[1:]...))
+	// +2 because we always add SupportedMethods and recoverPanik
+	wrappers := make([]Middleware, 0, len(f.middlewares)+len(endpoint.Middlewares)+2)
 	wrappers = append(wrappers, f.middlewares...)
+	wrappers = append(wrappers, SupportedMethods(endpoint.Methods[0], endpoint.Methods[1:]...))
 	wrappers = append(wrappers, endpoint.Middlewares...)
+	// Always inject recoverPanik as the final middleware in the chain. This
+	// allows it to capture any panics before other middlewares return and bubble
+	// up the panic as an error to those middlewares.
+	wrappers = append(wrappers, recoverPanik)
 	return NewHandler(endpoint.Name, endpoint.Handle, wrappers...)
 }
 
@@ -84,23 +91,23 @@ type Endpoint struct {
 // Validate checks for input errors on the Endpoint and returns an error
 // if any exist.
 func (e Endpoint) Validate() error {
-	var err errorsbp.Batch
+	var errs []error
 	if e.Name == "" {
-		err.Add(errors.New("httpbp: Endpoint.Name must be non-empty"))
+		errs = append(errs, errors.New("httpbp: Endpoint.Name must be non-empty"))
 	}
 	if e.Handle == nil {
-		err.Add(errors.New("httpbp: Endpoint.Handle must be non-nil"))
+		errs = append(errs, errors.New("httpbp: Endpoint.Handle must be non-nil"))
 	}
 	if len(e.Methods) == 0 {
-		err.Add(errors.New("httpbp: Endpoint.Methods must be non-empty"))
+		errs = append(errs, errors.New("httpbp: Endpoint.Methods must be non-empty"))
 	} else {
 		for _, method := range e.Methods {
 			if !allHTTPMethods[method] {
-				err.Add(fmt.Errorf("httpbp: Endpoint.Methods contains an invalid value: %q", method))
+				errs = append(errs, fmt.Errorf("httpbp: Endpoint.Methods contains an invalid value: %q", method))
 			}
 		}
 	}
-	return err.Compile()
+	return errors.Join(errs...)
 }
 
 // ServerArgs defines all of the arguments used to create a new HTTP
@@ -149,6 +156,17 @@ type ServerArgs struct {
 	// Logger is an optional arg to be called when the InjectEdgeRequestContext
 	// middleware failed to parse the edge request header for any reason.
 	Logger log.Wrapper
+
+	// The http.Server from stdlib would emit a log regarding [1] whenever it
+	// happens. Set SuppressIssue25192 to true to suppress that log.
+	//
+	// Regardless of the value of SuppressIssue25192,
+	// we always emit a prometheus counter of:
+	//
+	//     httpbp_server_upstream_issue_logs_total{upstream_issue="25192"}
+	//
+	// [1]: https://github.com/golang/go/issues/25192#issuecomment-992276264
+	SuppressIssue25192 bool
 }
 
 // ValidateAndSetDefaults checks the ServerArgs for any errors and sets any
@@ -158,12 +176,12 @@ type ServerArgs struct {
 // be used for testing purposes.  It is called as a part of setting up a new
 // Baseplate server.
 func (args ServerArgs) ValidateAndSetDefaults() (ServerArgs, error) {
-	var inputErrors errorsbp.Batch
+	var errs []error
 	if args.Baseplate == nil {
-		inputErrors.Add(errors.New("argument Baseplate must be non-nil"))
+		errs = append(errs, errors.New("argument Baseplate must be non-nil"))
 	}
 	for _, endpoint := range args.Endpoints {
-		inputErrors.Add(endpoint.Validate())
+		errs = append(errs, endpoint.Validate())
 	}
 	if args.EndpointRegistry == nil {
 		args.EndpointRegistry = http.NewServeMux()
@@ -171,7 +189,7 @@ func (args ServerArgs) ValidateAndSetDefaults() (ServerArgs, error) {
 	if args.TrustHandler == nil {
 		args.TrustHandler = NeverTrustHeaders{}
 	}
-	return args, inputErrors.Compile()
+	return args, errors.Join(errs...)
 }
 
 // SetupEndpoints calls ValidateAndSetDefaults and registeres the Endpoints
@@ -195,7 +213,11 @@ func (args ServerArgs) SetupEndpoints() (ServerArgs, error) {
 
 	factory := httpHandlerFactory{middlewares: wrappers}
 	for pattern, endpoint := range args.Endpoints {
-		args.EndpointRegistry.Handle(string(pattern), factory.NewHandler(endpoint))
+		handler := factory.NewHandler(endpoint)
+		if mw := internalv2compat.V2TracingHTTPServerMiddleware(); mw != nil {
+			handler = mw(string(pattern), handler)
+		}
+		args.EndpointRegistry.Handle(string(pattern), handler)
 	}
 	return args, nil
 }
@@ -205,28 +227,41 @@ func (args ServerArgs) SetupEndpoints() (ServerArgs, error) {
 //
 // The Endpoints given in the ServerArgs will be wrapped using the
 // default Baseplate Middleware as well as any additional Middleware
-// passed in.
+// passed in. In addition, panics will be automatically recovered from, reported,
+// and passed up the middleware chain as an HTTPError with the status code 500.
 func NewBaseplateServer(args ServerArgs) (baseplate.Server, error) {
 	args, err := args.SetupEndpoints()
 	if err != nil {
 		return nil, err
 	}
 
+	logger, err := httpServerLogger(log.C(context.Background()).Desugar(), args.SuppressIssue25192)
+	if err != nil {
+		// Should not happen, but if it really happens, we just fallback to stdlib
+		// logger, which is not that big a deal either.
+		log.Errorw(
+			"Failed to create error logger for stdlib http server",
+			"err", err,
+		)
+	}
+
 	srv := &http.Server{
-		Addr:         args.Baseplate.Config().Addr,
-		Handler:      args.EndpointRegistry,
-		ReadTimeout:  args.Baseplate.Config().Timeout,
-		WriteTimeout: args.Baseplate.Config().Timeout,
+		Addr:    args.Baseplate.GetConfig().Addr,
+		Handler: args.EndpointRegistry,
+
+		ErrorLog: logger,
 	}
 	for _, f := range args.OnShutdown {
 		srv.RegisterOnShutdown(f)
 	}
-	return &server{args.Baseplate, srv}, nil
+	return &server{bp: args.Baseplate, srv: srv}, nil
 }
 
 type server struct {
 	bp  baseplate.Baseplate
 	srv *http.Server
+
+	internalv2compat.IsHTTP
 }
 
 func (s server) Baseplate() baseplate.Baseplate {

@@ -1,60 +1,205 @@
 package thriftbp
 
 import (
+	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/reddit/baseplate.go/prometheusbp"
+	"github.com/reddit/baseplate.go/randbp"
 )
+
+type ttlClientGenerator func() (thrift.TClient, *countingDelegateTransport, error)
 
 // DefaultMaxConnectionAge is the default max age for a Thrift client connection.
 const DefaultMaxConnectionAge = time.Minute * 5
 
+// DefaultMaxConnectionAgeJitter is the default jitter to MaxConnectionAge for a
+// Thrift client connection.
+const DefaultMaxConnectionAgeJitter = 0.1
+
 var _ Client = (*ttlClient)(nil)
+
+type ttlClientState struct {
+	client     thrift.TClient
+	transport  *countingDelegateTransport
+	expiration time.Time // if expiration is zero, then the client will be kept open indefinetly.
+	timer      *time.Timer
+	closed     bool
+}
+
+// renew updates expiration and timer in s base on the given timestamp and
+// client.
+func (s *ttlClientState) renew(now time.Time, client *ttlClient) {
+	if client.ttl < 0 {
+		return
+	}
+	s.expiration = now.Add(client.ttl)
+	s.timer = time.AfterFunc(client.ttl, client.refresh)
+}
 
 // ttlClient is a Client implementation wrapping thrift's TTransport with a TTL.
 type ttlClient struct {
-	thrift.TClient
+	// configs needed for refresh to work
+	generator ttlClientGenerator
+	ttl       time.Duration
+	slug      string
 
-	trans thrift.TTransport
-
-	// if expiration is nil, then the client will be kept open indefinetly.
-	expiration *time.Time
+	// state guarded by lock (buffer-1 channel)
+	state chan *ttlClientState
 }
 
 // Close implements Client interface.
 //
 // It calls underlying TTransport's Close function.
 func (c *ttlClient) Close() error {
-	return c.trans.Close()
+	state := <-c.state
+	defer func() {
+		c.state <- state
+	}()
+	state.closed = true
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	return state.transport.Close()
+}
+
+func (c *ttlClient) Call(ctx context.Context, method string, args, result thrift.TStruct) (_ thrift.ResponseMeta, err error) {
+	state := <-c.state
+	defer func() {
+		c.state <- state
+	}()
+
+	defer func() {
+		read, written := state.transport.getBytesAndReset()
+		labels := prometheus.Labels{
+			methodLabel:     method,
+			clientNameLabel: c.slug,
+			successLabel:    prometheusbp.BoolString(err == nil),
+		}
+		clientPayloadSizeRequestBytes.With(labels).Observe(float64(written))
+		clientPayloadSizeResponseBytes.With(labels).Observe(float64(read))
+	}()
+	return state.client.Call(ctx, method, args, result)
 }
 
 // IsOpen implements Client interface.
 //
-// If TTL has passed, it closes the underlying TTransport and returns false.
-// Otherwise it just calls the underlying TTransport's IsOpen function.
+// It checks underlying TTransport's IsOpen first,
+// if that returns false, it returns false.
+// Otherwise it checks TTL,
+// returns false if TTL has passed and also close the underlying TTransport.
 func (c *ttlClient) IsOpen() bool {
-	if !c.trans.IsOpen() {
+	state := <-c.state
+	defer func() {
+		c.state <- state
+	}()
+	if !state.transport.IsOpen() {
 		return false
 	}
-	if c.expiration != nil && time.Now().After(*c.expiration) {
-		c.trans.Close()
+	if !state.expiration.IsZero() && time.Now().After(state.expiration) {
+		state.transport.Close()
 		return false
 	}
 	return true
 }
 
-// newTTLClient creates a ttlClient with a thrift TTransport and a ttl.
-func newTTLClient(trans thrift.TTransport, client thrift.TClient, ttl time.Duration) *ttlClient {
-	var expiration time.Time
+// refresh is called when the ttl hits to try to refresh the connection.
+func (c *ttlClient) refresh() {
+	client, transport, err := c.generator()
+	if err != nil {
+		// We cannot replace this connection in the background,
+		// leave client and transport be,
+		// this connection will be replaced by the pool upon next use.
+		ttlClientReplaceCounter.With(prometheus.Labels{
+			clientNameLabel: c.slug,
+			successLabel:    prometheusbp.BoolString(false),
+		}).Inc()
+		return
+	}
+
+	// replace with the refreshed connection
+	state := <-c.state
+	defer func() {
+		c.state <- state
+	}()
+	if state.closed {
+		// If Close was called after we entered this function,
+		// close the newly created connection and return early.
+		transport.Close()
+		return
+	}
+	state.renew(time.Now(), c)
+	state.client = client
+	if state.transport != nil {
+		// close the old transport before replacing it, to avoid connection leaks.
+		state.transport.Close()
+	}
+	state.transport = transport
+	ttlClientReplaceCounter.With(prometheus.Labels{
+		clientNameLabel: c.slug,
+		successLabel:    prometheusbp.BoolString(true),
+	}).Inc()
+}
+
+// newTTLClient creates a ttlClient with a thrift TTransport and ttl+jitter.
+func newTTLClient(generator ttlClientGenerator, ttl time.Duration, jitter float64, slug string) (*ttlClient, error) {
+	client, transport, err := generator()
+	if err != nil {
+		return nil, err
+	}
+
 	if ttl == 0 {
 		ttl = DefaultMaxConnectionAge
 	}
-	if ttl > 0 {
-		expiration = time.Now().Add(ttl)
+	duration := randbp.JitterDuration(ttl, jitter)
+	c := &ttlClient{
+		generator: generator,
+		ttl:       duration,
+		slug:      slug,
+
+		state: make(chan *ttlClientState, 1),
 	}
-	return &ttlClient{
-		TClient:    client,
-		trans:      trans,
-		expiration: &expiration,
+	state := &ttlClientState{
+		client:    client,
+		transport: transport,
 	}
+	state.renew(time.Now(), c)
+	c.state <- state
+
+	// Register the error counter so it can be monitored
+	ttlClientReplaceCounter.With(prometheus.Labels{
+		clientNameLabel: c.slug,
+		successLabel:    prometheusbp.BoolString(false),
+	})
+
+	return c, nil
+}
+
+type countingDelegateTransport struct {
+	thrift.TTransport
+
+	bytesRead    atomic.Uint64
+	bytesWritten atomic.Uint64
+}
+
+func (cdt *countingDelegateTransport) Read(p []byte) (n int, err error) {
+	defer func() {
+		cdt.bytesRead.Add(uint64(n))
+	}()
+	return cdt.TTransport.Read(p)
+}
+
+func (cdt *countingDelegateTransport) Write(p []byte) (n int, err error) {
+	defer func() {
+		cdt.bytesWritten.Add(uint64(n))
+	}()
+	return cdt.TTransport.Write(p)
+}
+
+func (cdt *countingDelegateTransport) getBytesAndReset() (read, written uint64) {
+	return cdt.bytesRead.Swap(0), cdt.bytesWritten.Swap(0)
 }

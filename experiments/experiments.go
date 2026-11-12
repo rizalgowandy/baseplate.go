@@ -1,3 +1,7 @@
+// Package experiments has been deprecated in favor of reddit-go/decider internal package.
+// Use Choose() in lieu of Variant(), which also enables optional auto-exposure.
+//
+// Deprecated: baseplate.go/experiments is deprecated. Instead, use reddit-go/decider (internal).
 package experiments
 
 import (
@@ -12,7 +16,11 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/reddit/baseplate.go/filewatcher"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/reddit/baseplate.go/filewatcher/v2"
+	"github.com/reddit/baseplate.go/internal/prometheusbpint"
 	"github.com/reddit/baseplate.go/log"
 	"github.com/reddit/baseplate.go/timebp"
 )
@@ -21,6 +29,16 @@ const (
 	numBuckets        = 1000
 	targetAllOverride = `{"OVERRIDE": true}`
 )
+
+var variantTotalRequests = promauto.With(prometheusbpint.GlobalRegistry).NewCounter(prometheus.CounterOpts{
+	Name: "experiments_go_variant_requests_total",
+	Help: "Total experiments.go Variant() request count",
+})
+
+var exposeTotalRequests = promauto.With(prometheusbpint.GlobalRegistry).NewCounter(prometheus.CounterOpts{
+	Name: "experiments_go_expose_requests_total",
+	Help: "Total experiments.go Expose() request count",
+})
 
 // MissingBucketKeyError is a special error returned by Variant functions,
 // to indicate that the bucket key from the args map is missing.
@@ -48,7 +66,7 @@ func (e MissingBucketKeyError) Error() string {
 // the experiment configuration fetcher daemon.  It will automatically reload
 // the cache when changed.
 type Experiments struct {
-	watcher     filewatcher.FileWatcher
+	watcher     filewatcher.FileWatcher[document]
 	eventLogger EventLogger
 }
 
@@ -58,7 +76,7 @@ type Experiments struct {
 // Context should come with a timeout otherwise this might block forever, i.e.
 // if the path never becomes available.
 func NewExperiments(ctx context.Context, path string, eventLogger EventLogger, logger log.Wrapper) (*Experiments, error) {
-	parser := func(r io.Reader) (interface{}, error) {
+	parser := func(r io.Reader) (document, error) {
 		var doc document
 		err := json.NewDecoder(r).Decode(&doc)
 		if err != nil {
@@ -68,11 +86,8 @@ func NewExperiments(ctx context.Context, path string, eventLogger EventLogger, l
 	}
 	result, err := filewatcher.New(
 		ctx,
-		filewatcher.Config{
-			Path:   path,
-			Parser: parser,
-			Logger: logger,
-		},
+		path,
+		parser,
 	)
 	if err != nil {
 		return nil, err
@@ -96,6 +111,8 @@ func NewExperiments(ctx context.Context, path string, eventLogger EventLogger, l
 // Caller usually want to check for that and handle it differently from other
 // errors. See its documentation for more details.
 func (e *Experiments) Variant(name string, args map[string]interface{}, bucketingEventOverride bool) (string, error) {
+	variantTotalRequests.Inc()
+
 	experiment, err := e.experiment(name)
 	if err != nil {
 		return "", err
@@ -106,7 +123,9 @@ func (e *Experiments) Variant(name string, args map[string]interface{}, bucketin
 // Expose logs an event to indicate that a user has been exposed to an
 // experimental treatment.
 func (e *Experiments) Expose(ctx context.Context, experimentName string, event ExperimentEvent) error {
-	doc := e.watcher.Get().(document)
+	exposeTotalRequests.Inc()
+
+	doc := e.watcher.Get()
 	experiment, ok := doc[experimentName]
 	if !ok {
 		return UnknownExperimentError(experimentName)
@@ -119,7 +138,7 @@ func (e *Experiments) Expose(ctx context.Context, experimentName string, event E
 }
 
 func (e *Experiments) experiment(name string) (*SimpleExperiment, error) {
-	doc := e.watcher.Get().(document)
+	doc := e.watcher.Get()
 	experiment, ok := doc[name]
 	if !ok {
 		return nil, UnknownExperimentError(name)
@@ -283,7 +302,7 @@ func (e *SimpleExperiment) Variant(args map[string]interface{}) (string, error) 
 		return "", nil
 	}
 	args = lowerArguments(args)
-	if value, _ := args[e.bucketVal]; value == nil || value == "" {
+	if value := args[e.bucketVal]; value == nil || value == "" {
 		return "", MissingBucketKeyError{
 			ExperimentName: e.name,
 			ArgsKey:        e.bucketVal,

@@ -3,7 +3,7 @@ package thriftbp_test
 import (
 	"context"
 
-	baseplate "github.com/reddit/baseplate.go"
+	"github.com/reddit/baseplate.go"
 	"github.com/reddit/baseplate.go/ecinterface"
 	bpgen "github.com/reddit/baseplate.go/internal/gen-go/reddit/baseplate"
 	"github.com/reddit/baseplate.go/log"
@@ -15,8 +15,13 @@ import (
 func ExampleNewBaseplateServer() {
 	// In real code this MUST be replaced by the factory from the actual implementation.
 	var ecFactory ecinterface.Factory
+
+	var cfg baseplate.Config
+	if err := baseplate.ParseConfigYAML(&cfg); err != nil {
+		panic(err)
+	}
 	ctx, bp, err := baseplate.New(context.Background(), baseplate.NewArgs{
-		ConfigPath:         "example.yaml",
+		Config:             cfg,
 		EdgeContextFactory: ecFactory,
 	})
 	if err != nil {
@@ -36,5 +41,6 @@ func ExampleNewBaseplateServer() {
 		log.Fatal(err)
 	}
 
+	go thriftbp.ServeAdmin()
 	log.Info(baseplate.Serve(ctx, baseplate.ServeArgs{Server: server}))
 }
